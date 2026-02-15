@@ -25,6 +25,9 @@ By Yanjie Ze, Siheng Zhao, Weizhuo Wang, Angjoo Kanazawa†, Rocky Duan†, Piet
 
 - [Installation](#installation)
 - [Usage](#usage)
+- [RealSense D435i Camera Integration](#realsense-d435i-camera-integration)
+- [Inspire Hand Control](#inspire-hand-control)
+- [Pico 4 Ultra Finger Tracking](#pico-4-ultra-finger-tracking)
 - [Citation and Contact](#citation-and-contact)
 
 
@@ -291,6 +294,143 @@ You should be able to
 6) run the neck controller script
 7) run the ZED streaming script
 all in this GUI. This GUI is also what I use for data collection and teleoperation.
+
+# RealSense D435i Camera Integration
+
+The G1 robot has an internal Intel RealSense D435i connected to the Orin NX via USB. This pipeline streams **RGB + aligned depth** at **424×240 @ 60 fps** over ZMQ to the workstation for data collection, alongside (and independently of) the existing ZED Mini pipeline.
+
+### Quick Start
+
+1. **Deploy the streamer to the Orin:**
+```bash
+bash deploy_real/onboard/deploy_to_robot.sh
+```
+
+2. **Start the streamer on the Orin:**
+```bash
+ssh unitree@192.168.123.164
+bash ~/g1-onboard/start_realsense.sh
+```
+
+3. **Start the recorder on the workstation:**
+```bash
+bash data_record_d435.sh
+```
+
+4. **Toggle recording** with the PICO controller:
+   - **Left controller Y button** — start/stop episode recording
+   - **Left controller axis click** — quit recording
+
+### Data Format
+Episodes are saved to `deploy_real/twist2_demonstration/<task_name>/`, each containing `data.json` with per-frame state/action vectors, `rgb/` JPEG images, and `depth/` uint16 PNG depth maps.
+
+### Validation
+```bash
+cd deploy_real
+python validate_d435_data.py twist2_demonstration/<task_name>           # Check all episodes
+python validate_d435_data.py twist2_demonstration/<task_name> --show    # Visual spot-check
+```
+
+For full details (wire format, CLI flags, troubleshooting), see [doc/REALSENSE_CAMERA.md](./doc/REALSENSE_CAMERA.md).
+
+
+# Inspire Hand Control
+
+TWIST2 supports the **Inspire RH56DFTP** dexterous hands (6 DOF per hand), connected via Modbus TCP.
+
+### Hardware Setup
+The Inspire hands connect to the workstation (or Orin) via Ethernet. Default IPs:
+- Left hand: `192.168.123.210`
+- Right hand: `192.168.123.211`
+
+### Usage
+Inspire hand support is enabled via the `--hand_type inspire` flag (already set in `teleop.sh` and `sim2real.sh`):
+
+```bash
+# In teleop.sh — already configured:
+python xrobot_teleop_to_robot_w_hand.py --robot unitree_g1 --hand_type inspire ...
+
+# In sim2real.sh — already configured:
+python server_low_level_g1_real.py --policy <ckpt> --use_hand --hand_type inspire
+```
+
+### DOF Mapping
+| Index | Joint          | Range     |
+|-------|----------------|-----------|
+| 0     | Pinky          | 0–1000    |
+| 1     | Ring           | 0–1000    |
+| 2     | Middle         | 0–1000    |
+| 3     | Index          | 0–1000    |
+| 4     | Thumb bend     | 0–1000    |
+| 5     | Thumb rotation | 0–1000    |
+
+The value `0` = fully open, `1000` = fully closed. Commands are sent at the teleop loop rate through Redis → `InspireHandController.ctrl_dual_hand()`.
+
+Custom Inspire hand IPs can be set via `--inspire_left_ip` and `--inspire_right_ip` on `server_low_level_g1_real.py`.
+
+### Dependencies
+```bash
+pip install pymodbus  # Already included in twist2 env
+```
+
+
+# Pico 4 Ultra Finger Tracking
+
+Instead of using controller buttons to open/close the hands, the **Pico 4 Ultra's hand tracking** can be used for per-finger dexterous control of the Inspire hands.
+
+### How It Works
+1. The Pico headset tracks 26 hand joints per hand (OpenXR format) — positions and orientations
+2. The `PicoFingerTracker` class computes per-finger curl angles using geometric vector analysis (no external dependencies beyond numpy)
+3. Curl values are mapped to Inspire 6-DOF commands (0–1000 per finger)
+4. EMA smoothing reduces tracking jitter
+
+### Operational Setup
+- **VR controllers strapped to the user's wrists** — body tracking (SMPLX) continues working normally via controller poses
+- **A separate operator at the keyboard** controls the state machine (start / pause / exit)
+- **Finger tracking runs simultaneously** with controller tracking
+
+### Usage
+```bash
+# Uncomment --finger_tracking in teleop.sh, or pass directly:
+python xrobot_teleop_to_robot_w_hand.py --robot unitree_g1 \
+    --hand_type inspire \
+    --finger_tracking \
+    --redis_ip localhost \
+    --target_fps 100
+```
+
+### Keyboard Controls (separate operator)
+| Key              | Action                                  |
+|------------------|-----------------------------------------|
+| `s` or `Enter`   | Cycle: idle → teleop → pause → teleop  |
+| `q`              | Exit program                            |
+| `e`              | Emergency stop                          |
+
+### Tuning Parameters
+The `PicoFingerTracker` class in `deploy_real/data_utils/finger_tracking.py` has configurable parameters:
+- `smoothing_alpha` (default `0.3`) — EMA smoothing factor (higher = smoother but more latency)
+- `curl_gain` (default `1.5`) — Sensitivity multiplier (higher = hand closes faster)
+- `curl_deadzone` (default `0.05`) — Minimum curl below which output is 0 (reduces jitter at rest)
+
+### Dry-Run Test
+You can verify the finger tracking module without any hardware:
+```bash
+cd deploy_real
+python3 data_utils/finger_tracking.py
+```
+
+### Architecture
+```
+Pico 4 Ultra
+├── Body pose (SMPLX via controllers on wrists) → XRobotStreamer → GMR retargeting → 35D mimic obs
+└── Hand tracking (26 joints per hand)           → PicoFingerTracker → 6-DOF Inspire angles
+                                                                           ↓
+Keyboard operator → State machine ──────────────────────────────────────► Redis
+                                                                           ↓
+                                                          server_low_level_g1_real.py
+                                                                           ↓
+                                                         InspireHandController (Modbus TCP)
+```
 
 
 # Citation and Contact

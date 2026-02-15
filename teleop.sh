@@ -18,4 +18,5 @@ python xrobot_teleop_to_robot_w_hand.py --robot unitree_g1 \
              --measure_fps 1 \
              --hand_type inspire \
             #  --smooth \
-            #  --pinch_mode
+            #  --pinch_mode \
+            #  --finger_tracking

@@ -49,6 +49,7 @@ from general_motion_retargeting import XRobotStreamer
 from data_utils.params import DEFAULT_MIMIC_OBS, DEFAULT_HAND_POSE
 from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
 from data_utils.fps_monitor import FPSMonitor
+from data_utils.finger_tracking import PicoFingerTracker
 
 def start_interpolation(state_machine, start_obs, end_obs, duration=1.0):
     """Start interpolation from start_obs to end_obs over given duration"""
@@ -107,7 +108,8 @@ def extract_mimic_obs_whole_body(qpos, last_qpos, dt=1/30):
 
 
 class StateMachine:
-    def __init__(self, enable_smooth=False, smooth_window_size=5, use_pinch=False):
+    def __init__(self, enable_smooth=False, smooth_window_size=5, use_pinch=False,
+                 use_finger_tracking=False):
         """
         State process for teleoperation:
         idle -> teleop -> pause -> teleop ... -> idle -> exit
@@ -134,6 +136,18 @@ class StateMachine:
         self.use_pinch = use_pinch
         # Hand control parameters
         self.hand_movement_step = 0.05  # 5% movement per press/hold
+        
+        # Finger tracking
+        self.use_finger_tracking = use_finger_tracking
+        if use_finger_tracking:
+            self.finger_tracker = PicoFingerTracker(
+                smoothing_alpha=0.3,
+                curl_gain=1.5,
+                curl_deadzone=0.05
+            )
+            # Tracked finger poses (6-DOF Inspire angles per hand)
+            self._tracked_left_hand_pose = None
+            self._tracked_right_hand_pose = None
         
         # Velocity commands from joystick
         self.velocity_commands = np.array([0.0, 0.0, 0.0])  # [vx, vy, vyaw]
@@ -274,8 +288,39 @@ class StateMachine:
     def get_hand_state(self):
         return self.hand_left_position, self.hand_right_position
     
+    def update_hand_from_tracking(self, left_hand_data, right_hand_data):
+        """Update hand poses from Pico finger tracking data.
+        
+        Args:
+            left_hand_data: Pico hand tracking array for left hand (26×7 or 27×7)
+            right_hand_data: Pico hand tracking array for right hand (26×7 or 27×7)
+        """
+        if not self.use_finger_tracking:
+            return
+        
+        if left_hand_data is not None:
+            result = self.finger_tracker.pico_to_inspire_angles(left_hand_data, 'left')
+            if result is not None:
+                self._tracked_left_hand_pose = result
+        
+        if right_hand_data is not None:
+            result = self.finger_tracker.pico_to_inspire_angles(right_hand_data, 'right')
+            if result is not None:
+                self._tracked_right_hand_pose = result
+    
     def get_hand_pose(self, robot_name):
-        """Get interpolated hand poses based on current hand positions"""
+        """Get hand poses — from finger tracking or button interpolation."""
+        # If finger tracking is active and we have tracked data, use it directly
+        if self.use_finger_tracking:
+            # For Inspire hands, return the tracked 6-DOF angles directly
+            left_default = DEFAULT_HAND_POSE.get(robot_name, {}).get('left', {}).get('open', np.zeros(6, dtype=np.float32))
+            right_default = DEFAULT_HAND_POSE.get(robot_name, {}).get('right', {}).get('open', np.zeros(6, dtype=np.float32))
+            
+            left_pose = self._tracked_left_hand_pose if self._tracked_left_hand_pose is not None else left_default
+            right_pose = self._tracked_right_hand_pose if self._tracked_right_hand_pose is not None else right_default
+            return left_pose, right_pose
+        
+        # Original button-based interpolation
         use_pinch = self.use_pinch
         # Get open and closed poses
         
@@ -334,6 +379,8 @@ class StateMachine:
     def reset_smooth_history(self):
         """Reset smooth history (call when transitioning states)"""
         self.smooth_history = []
+        if self.use_finger_tracking:
+            self.finger_tracker.reset()
     
     def _emergency_stop(self):
         """Emergency stop: kill sim2real.sh process (server_low_level_g1_real_future.py)"""
@@ -367,6 +414,7 @@ class XRobotTeleopToRobot:
         self.xml_file = ROBOT_XML_DICT[args.robot]
         self.robot_base = ROBOT_BASE_DICT[args.robot]
         self.hand_type = getattr(args, 'hand_type', 'dex3')
+        self.use_finger_tracking = getattr(args, 'finger_tracking', False)
         # Select hand pose configuration based on hand type
         if self.hand_type == 'inspire':
             self.hand_pose_key = "unitree_g1_inspire"
@@ -376,6 +424,7 @@ class XRobotTeleopToRobot:
         print(f"Hand type: {self.hand_type}")
         print(f"Hand pose config: {self.hand_pose_key}")
         print(f"Pinch mode: {self.args.pinch_mode}")
+        print(f"Finger tracking: {self.use_finger_tracking}")
         # Initialize state tracking
         self.last_qpos = None
         self.last_time = time.time()
@@ -391,7 +440,8 @@ class XRobotTeleopToRobot:
         self.state_machine = StateMachine(
             enable_smooth=args.smooth,
             smooth_window_size=args.smooth_window_size,
-            use_pinch=args.pinch_mode
+            use_pinch=args.pinch_mode,
+            use_finger_tracking=self.use_finger_tracking
         )
         self.rate = None
         
@@ -407,6 +457,10 @@ class XRobotTeleopToRobot:
             expected_fps=self.target_fps,
             name="Teleop Loop"
         )
+        
+        # Keyboard control thread (for finger tracking mode)
+        self._keyboard_thread = None
+        self._keyboard_command = None
 
 
     def setup_teleop_data_streamer(self):
@@ -694,6 +748,69 @@ class XRobotTeleopToRobot:
                 
 
 
+    def _start_keyboard_control_thread(self):
+        """Start a daemon thread that reads keyboard input for state machine control.
+        
+        Used when finger tracking is enabled and a separate operator
+        controls start/pause/exit via keyboard.
+        
+        Keyboard commands:
+          s / Enter : Cycle state (idle -> teleop -> pause -> teleop ...)
+          q         : Exit program
+          e         : Emergency stop
+        """
+        import threading
+        
+        def keyboard_loop():
+            print("\n" + "=" * 50)
+            print("KEYBOARD CONTROL ACTIVE (finger tracking mode)")
+            print("  [s] or [Enter] : Start / Pause / Resume teleop")
+            print("  [q]            : Exit program")
+            print("  [e]            : Emergency stop")
+            print("=" * 50 + "\n")
+            
+            while True:
+                try:
+                    cmd = input().strip().lower()
+                    if cmd in ('s', ''):
+                        self._keyboard_command = 'cycle'
+                    elif cmd == 'q':
+                        self._keyboard_command = 'exit'
+                    elif cmd == 'e':
+                        self._keyboard_command = 'emergency'
+                except EOFError:
+                    break
+        
+        self._keyboard_thread = threading.Thread(target=keyboard_loop, daemon=True)
+        self._keyboard_thread.start()
+    
+    def _process_keyboard_commands(self):
+        """Process any pending keyboard commands for state machine control."""
+        cmd = self._keyboard_command
+        if cmd is None:
+            return
+        
+        self._keyboard_command = None
+        
+        if cmd == 'cycle':
+            # Mimic right_key_one press: idle -> teleop -> pause -> teleop
+            self.state_machine.previous_state = self.state_machine.state
+            if self.state_machine.state == "idle":
+                self.state_machine.state = "teleop"
+                print("[Keyboard] State: idle -> teleop")
+            elif self.state_machine.state == "teleop":
+                self.state_machine.state = "pause"
+                print("[Keyboard] State: teleop -> pause")
+            elif self.state_machine.state == "pause":
+                self.state_machine.state = "teleop"
+                print("[Keyboard] State: pause -> teleop")
+        elif cmd == 'exit':
+            self.state_machine.previous_state = self.state_machine.state
+            self.state_machine.state = "exit"
+            print("[Keyboard] Exit requested")
+        elif cmd == 'emergency':
+            self.state_machine._emergency_stop()
+
     def initialize_all_systems(self):
         """Initialize all required systems"""
         print("Initializing teleop systems...")
@@ -705,9 +822,13 @@ class XRobotTeleopToRobot:
         self.setup_rate_limiter()
 
         print("Teleop state machine initialized. Controls:")
-        print("- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...")
-        print("- Left controller key_one: Exit program")
-        print("- Left controller axis_click: Emergency stop - kills sim2real.sh process")
+        if self.use_finger_tracking:
+            print("- FINGER TRACKING MODE: Hand poses from Pico hand tracking")
+            print("- Keyboard control by separate operator (see terminal prompts)")
+        else:
+            print("- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...")
+            print("- Left controller key_one: Exit program")
+            print("- Left controller axis_click: Emergency stop - kills sim2real.sh process")
         print("- Left controller axis: Control root xy velocity")
         print("- Right controller axis: Control yaw velocity")
         print("- Publishes 35-dimensional mimic observations")
@@ -722,6 +843,10 @@ class XRobotTeleopToRobot:
             print(f"- FPS measurement: ENABLED (detailed stats every {self.fps_monitor.detailed_print_interval} steps)")
         else:
             print(f"- FPS measurement: Quick stats only (every {self.fps_monitor.quick_print_interval} steps)")
+
+        # Start keyboard control thread if using finger tracking
+        if self.use_finger_tracking:
+            self._start_keyboard_control_thread()
 
         print("Ready to receive teleop data.")
 
@@ -742,10 +867,18 @@ class XRobotTeleopToRobot:
                 # Get current teleop data
                 smplx_data, left_hand_data, right_hand_data, controller_data, headset_data = self.get_teleop_data()
                 
-                # Update state machine
+                # Process keyboard commands (finger tracking mode)
+                if self.use_finger_tracking:
+                    self._process_keyboard_commands()
+                
+                # Update state machine from controller
                 if controller_data is not None:
                     self.state_machine.update(controller_data)
                     self.send_controller_data_to_redis(controller_data)
+                
+                # Update hand poses from finger tracking
+                if self.use_finger_tracking and self.state_machine.is_teleop_active():
+                    self.state_machine.update_hand_from_tracking(left_hand_data, right_hand_data)
                 
                 # Check if we should exit
                 if self.state_machine.should_exit():
@@ -847,6 +980,12 @@ def parse_arguments():
         type=int,
         default=0,
         help="Measure and print detailed FPS statistics (0=disabled, 1=enabled).",
+    )
+    parser.add_argument(
+        "--finger_tracking",
+        action="store_true",
+        help="Use Pico 4 Ultra finger tracking for Inspire hand control instead of controller buttons.",
+        default=False,
     )
     return parser.parse_args()
 

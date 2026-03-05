@@ -5,4 +5,5 @@ python convert_twist2_to_lerobot.py \
     --data_dir twist2_demonstration/20260210_1017 \
     --output_dir /path/to/output_lowlevel \
     --repo_id "username/twist2_demos_lowlevel" \
-    --fps 60 --action_mode low_level --use_videos
+    --fps 60 --action_mode low_level --use_videos \
+    --hand_type inspire  # Use 'dex3' for 7-DOF Dex3 hands (default)

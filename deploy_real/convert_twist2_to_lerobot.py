@@ -26,14 +26,13 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # ---------- Dimension constants ----------
 DIM_STATE_BODY = 34       # ang_vel(3) + roll_pitch(2) + dof_pos(29)
-DIM_STATE_HAND = 7        # per hand
 DIM_STATE_NECK = 2
-DIM_STATE = DIM_STATE_BODY + DIM_STATE_HAND * 2 + DIM_STATE_NECK  # 50
 
 DIM_ACTION_BODY = 35      # high-level teleop target
-DIM_ACTION_HAND = 7       # per hand
 DIM_ACTION_NECK = 2
 DIM_ACTION_LOW_LEVEL = 29  # low-level motor commands
+
+HAND_DIM = {'dex3': 7, 'inspire': 6}
 
 
 def parse_args():
@@ -66,6 +65,8 @@ def parse_args():
                         help="Push dataset to HuggingFace Hub")
     parser.add_argument("--image_writer_processes", type=int, default=0)
     parser.add_argument("--image_writer_threads", type=int, default=4)
+    parser.add_argument("--hand_type", type=str, default="dex3", choices=["dex3", "inspire"],
+                        help="Hand type: dex3 (7-DOF) or inspire (6-DOF). Must match what was used during recording.")
 
     args = parser.parse_args()
 
@@ -76,16 +77,16 @@ def parse_args():
     return args
 
 
-def get_action_dim(action_mode: str, include_hand: bool) -> int:
+def get_action_dim(action_mode: str, include_hand: bool, hand_dof: int) -> int:
     if action_mode == "high_level":
         dim = DIM_ACTION_BODY
         if include_hand:
-            dim += DIM_ACTION_HAND * 2 + DIM_ACTION_NECK  # +16
+            dim += hand_dof * 2 + DIM_ACTION_NECK
         return dim
     else:  # low_level
         dim = DIM_ACTION_LOW_LEVEL
         if include_hand:
-            dim += DIM_ACTION_HAND * 2  # +14
+            dim += hand_dof * 2
         return dim
 
 
@@ -103,35 +104,39 @@ def safe_array(value, expected_dim: int, field_name: str, frame_idx: int) -> np.
     return arr
 
 
-def build_state(frame: dict, idx: int) -> np.ndarray:
-    """Build 50d observation state vector."""
+def build_state(frame: dict, idx: int, hand_dof: int) -> np.ndarray:
+    """Build observation state vector."""
     state_body = safe_array(frame.get("state_body"), DIM_STATE_BODY, "state_body", idx)
-    hand_left = safe_array(frame.get("state_hand_left"), DIM_STATE_HAND, "state_hand_left", idx)
-    hand_right = safe_array(frame.get("state_hand_right"), DIM_STATE_HAND, "state_hand_right", idx)
+    hand_left = safe_array(frame.get("state_hand_left"), hand_dof, "state_hand_left", idx)
+    hand_right = safe_array(frame.get("state_hand_right"), hand_dof, "state_hand_right", idx)
     neck = safe_array(frame.get("state_neck"), DIM_STATE_NECK, "state_neck", idx)
     return np.concatenate([state_body, hand_left, hand_right, neck])
 
 
-def build_action(frame: dict, idx: int, action_mode: str, include_hand: bool) -> np.ndarray:
+def build_action(frame: dict, idx: int, action_mode: str, include_hand: bool, hand_dof: int) -> np.ndarray:
     """Build action vector based on mode and hand flag."""
     if action_mode == "high_level":
         action = safe_array(frame.get("action_body"), DIM_ACTION_BODY, "action_body", idx)
         if include_hand:
-            hand_left = safe_array(frame.get("action_hand_left"), DIM_ACTION_HAND, "action_hand_left", idx)
-            hand_right = safe_array(frame.get("action_hand_right"), DIM_ACTION_HAND, "action_hand_right", idx)
+            hand_left = safe_array(frame.get("action_hand_left"), hand_dof, "action_hand_left", idx)
+            hand_right = safe_array(frame.get("action_hand_right"), hand_dof, "action_hand_right", idx)
             neck = safe_array(frame.get("action_neck"), DIM_ACTION_NECK, "action_neck", idx)
             action = np.concatenate([action, hand_left, hand_right, neck])
     else:  # low_level
         action = safe_array(frame.get("action_low_level"), DIM_ACTION_LOW_LEVEL, "action_low_level", idx)
         if include_hand:
-            hand_left = safe_array(frame.get("action_hand_left"), DIM_ACTION_HAND, "action_hand_left", idx)
-            hand_right = safe_array(frame.get("action_hand_right"), DIM_ACTION_HAND, "action_hand_right", idx)
+            hand_left = safe_array(frame.get("action_hand_left"), hand_dof, "action_hand_left", idx)
+            hand_right = safe_array(frame.get("action_hand_right"), hand_dof, "action_hand_right", idx)
             action = np.concatenate([action, hand_left, hand_right])
     return action
 
 
 def main():
     args = parse_args()
+
+    hand_dof = HAND_DIM[args.hand_type]
+    dim_state = DIM_STATE_BODY + hand_dof * 2 + DIM_STATE_NECK
+    print(f"Hand type: {args.hand_type} ({hand_dof}-DOF per hand)")
 
     data_dir = Path(args.data_dir)
     if not data_dir.is_absolute():
@@ -159,9 +164,9 @@ def main():
     print(f"Image dimensions: {height}x{width}")
 
     # Compute action dim
-    action_dim = get_action_dim(args.action_mode, args.include_hand)
+    action_dim = get_action_dim(args.action_mode, args.include_hand, hand_dof)
     print(f"Action mode: {args.action_mode}, include_hand: {args.include_hand}, action_dim: {action_dim}")
-    print(f"State dim: {DIM_STATE}")
+    print(f"State dim: {dim_state}")
 
     # Define features
     vision_dtype = "video" if args.use_videos else "image"
@@ -173,7 +178,7 @@ def main():
         },
         "observation.state": {
             "dtype": "float32",
-            "shape": (DIM_STATE,),
+            "shape": (dim_state,),
             "names": ["state"],
         },
         "action": {
@@ -217,8 +222,8 @@ def main():
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
             # Build state and action
-            state = build_state(frame, idx)
-            action = build_action(frame, idx, args.action_mode, args.include_hand)
+            state = build_state(frame, idx, hand_dof)
+            action = build_action(frame, idx, args.action_mode, args.include_hand, hand_dof)
 
             frame_data = {
                 "observation.images.head_rgb": img_rgb,
@@ -244,8 +249,9 @@ def main():
     print("Conversion complete!")
     print(f"  Episodes:   {len(episode_dirs)}")
     print(f"  Frames:     {total_frames}")
-    print(f"  State dim:  {DIM_STATE}")
+    print(f"  State dim:  {dim_state}")
     print(f"  Action dim: {action_dim}")
+    print(f"  Hand type:  {args.hand_type} ({hand_dof}-DOF)")
     print(f"  Image size: {height}x{width}")
     print(f"  Action mode: {args.action_mode}")
     print(f"  Include hand: {args.include_hand}")

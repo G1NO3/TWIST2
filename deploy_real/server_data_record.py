@@ -146,14 +146,17 @@ def main(args):
                     "t_state",
 
                     "action_body_unitree_g1_with_hands",
-                    "action_hand_left_unitree_g1_with_hands", 
+                    "action_hand_left_unitree_g1_with_hands",
                     "action_hand_right_unitree_g1_with_hands",
                     "action_neck_unitree_g1_with_hands",
                     "t_action",
+
+                    "force_hand_left_unitree_g1_with_hands",
+                    "force_hand_right_unitree_g1_with_hands",
                 ]
-                
+
                 data_dict_keys = [
-                    "state_body", 
+                    "state_body",
                     "state_hand_left",
                     "state_hand_right",
                     "state_neck",
@@ -161,9 +164,12 @@ def main(args):
 
                     "action_body",
                     "action_hand_left",
-                    "action_hand_right", 
+                    "action_hand_right",
                     "action_neck",
                     "t_action",
+
+                    "force_hand_left",
+                    "force_hand_right",
                 ]
                 
                 try:

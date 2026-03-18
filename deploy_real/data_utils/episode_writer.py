@@ -202,6 +202,14 @@ class EpisodeWriter():
         if action_low_level is not None:
             item_data['action_low_level'] = action_low_level
 
+        # hand force/current (tactile proxy)
+        force_hand_left = item_data.get('force_hand_left', None)
+        force_hand_right = item_data.get('force_hand_right', None)
+        if force_hand_left is not None:
+            item_data['force_hand_left'] = force_hand_left
+        if force_hand_right is not None:
+            item_data['force_hand_right'] = force_hand_right
+
         # Save item_data to episode_data
         # Update episode data
         self.episode_data.append(item_data)

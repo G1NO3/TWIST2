@@ -33,6 +33,7 @@ DIM_ACTION_NECK = 2
 DIM_ACTION_LOW_LEVEL = 29  # low-level motor commands
 
 HAND_DIM = {'dex3': 7, 'inspire': 6}
+DIM_FORCE_HAND = {'dex3': 7, 'inspire': 6}  # motor current per finger
 
 
 def parse_args():
@@ -67,6 +68,8 @@ def parse_args():
     parser.add_argument("--image_writer_threads", type=int, default=4)
     parser.add_argument("--hand_type", type=str, default="dex3", choices=["dex3", "inspire"],
                         help="Hand type: dex3 (7-DOF) or inspire (6-DOF). Must match what was used during recording.")
+    parser.add_argument("--include_force", action="store_true", default=False,
+                        help="Include hand force/current data as observation.force (requires force-enabled recordings)")
 
     args = parser.parse_args()
 
@@ -131,6 +134,13 @@ def build_action(frame: dict, idx: int, action_mode: str, include_hand: bool, ha
     return action
 
 
+def build_force(frame: dict, idx: int, hand_dof: int) -> np.ndarray:
+    """Build force observation vector (motor current from both hands)."""
+    force_left = safe_array(frame.get("force_hand_left"), hand_dof, "force_hand_left", idx)
+    force_right = safe_array(frame.get("force_hand_right"), hand_dof, "force_hand_right", idx)
+    return np.concatenate([force_left, force_right])
+
+
 def main():
     args = parse_args()
 
@@ -165,8 +175,11 @@ def main():
 
     # Compute action dim
     action_dim = get_action_dim(args.action_mode, args.include_hand, hand_dof)
+    dim_force = hand_dof * 2  # left + right
     print(f"Action mode: {args.action_mode}, include_hand: {args.include_hand}, action_dim: {action_dim}")
     print(f"State dim: {dim_state}")
+    if args.include_force:
+        print(f"Force dim: {dim_force} (motor current, {hand_dof} per hand)")
 
     # Define features
     vision_dtype = "video" if args.use_videos else "image"
@@ -187,6 +200,13 @@ def main():
             "names": ["action"],
         },
     }
+
+    if args.include_force:
+        features["observation.force"] = {
+            "dtype": "float32",
+            "shape": (dim_force,),
+            "names": ["force"],
+        }
 
     # Create dataset
     dataset = LeRobotDataset.create(
@@ -231,6 +251,9 @@ def main():
                 "action": action,
                 "task": args.task_name,
             }
+
+            if args.include_force:
+                frame_data["observation.force"] = build_force(frame, idx, hand_dof)
             dataset.add_frame(frame_data)
 
         dataset.save_episode()
@@ -255,6 +278,7 @@ def main():
     print(f"  Image size: {height}x{width}")
     print(f"  Action mode: {args.action_mode}")
     print(f"  Include hand: {args.include_hand}")
+    print(f"  Include force: {args.include_force}")
     print(f"  Output:     {output_dir}")
     print("=" * 60)
 

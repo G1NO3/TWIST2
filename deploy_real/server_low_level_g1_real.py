@@ -237,6 +237,8 @@ class RealTimePolicyController(object):
                     hand_right_json = json.dumps(right_hand_state.tolist())
                     self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", hand_left_json)
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", hand_right_json)
+                    self.redis_pipeline.set("force_hand_left_unitree_g1_with_hands", json.dumps(lh_tau.tolist()))
+                    self.redis_pipeline.set("force_hand_right_unitree_g1_with_hands", json.dumps(rh_tau.tolist()))
                 
                 self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_target_dof_pos.tolist()))
                 # execute the pipeline once here for setting the keys

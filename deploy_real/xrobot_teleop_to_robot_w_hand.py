@@ -24,32 +24,34 @@ Whole-Body Teleop Features:
 """
 import argparse
 import json
-import pathlib
 import os
+import pathlib
 import subprocess
 import sys
 import time
 
+import cv2
 import mujoco as mj
 import mujoco.viewer as mjv
 import numpy as np
-from loop_rate_limiters import RateLimiter
-from scipy.spatial.transform import Rotation as R
-from general_motion_retargeting import GeneralMotionRetargeting as GMR
-from general_motion_retargeting import draw_frame
-from general_motion_retargeting import ROBOT_XML_DICT, ROBOT_BASE_DICT
-from general_motion_retargeting import human_head_to_robot_neck
-from rich import print
-from tqdm import tqdm
-import cv2
 import redis
-from rich import print
-from general_motion_retargeting import XRobotStreamer
-
-from data_utils.params import DEFAULT_MIMIC_OBS, DEFAULT_HAND_POSE
-from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
-from data_utils.fps_monitor import FPSMonitor
 from data_utils.finger_tracking import PicoFingerTracker
+from data_utils.fps_monitor import FPSMonitor
+from data_utils.params import DEFAULT_HAND_POSE, DEFAULT_MIMIC_OBS
+from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
+from general_motion_retargeting import (
+    ROBOT_BASE_DICT,
+    ROBOT_XML_DICT,
+    XRobotStreamer,
+    draw_frame,
+    human_head_to_robot_neck,
+)
+from general_motion_retargeting import GeneralMotionRetargeting as GMR
+from loop_rate_limiters import RateLimiter
+from rich import print
+from scipy.spatial.transform import Rotation as R
+from tqdm import tqdm
+
 
 def start_interpolation(state_machine, start_obs, end_obs, duration=1.0):
     """Start interpolation from start_obs to end_obs over given duration"""
@@ -347,11 +349,11 @@ class StateMachine:
             r_thumb = self.hand_right_thumb_position * 1000
             left_pose = np.array([
                 l_finger, l_finger, l_finger, l_finger,  # pinky, ring, middle, index
-                l_thumb, l_thumb,                         # thumb bend, thumb rotation
+                1000, l_thumb,                               # thumb bend (neutral), thumb rotation
             ], dtype=np.float32)
             right_pose = np.array([
                 r_finger, r_finger, r_finger, r_finger,  # pinky, ring, middle, index
-                r_thumb, r_thumb,                         # thumb bend, thumb rotation
+                1000, r_thumb,                               # thumb bend (neutral), thumb rotation
             ], dtype=np.float32)
             return left_pose, right_pose
 

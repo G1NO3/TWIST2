@@ -66,7 +66,13 @@ def main(args):
     depth_array = np.ndarray(depth_shape, dtype=np.float32, buffer=depth_shared_memory.buf)
 
     # ---- Vision client ----
-    image_show = True
+    try:
+        cv2.namedWindow("__test__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__test__")
+        image_show = True
+    except cv2.error:
+        image_show = False
+        print("[Warning] OpenCV GUI not available (headless build). Disabling image preview.")
     vision_client = VisionClient(
         server_address=args.robot_ip,
         port=args.camera_port,
@@ -185,6 +191,8 @@ def main(args):
                     "action_neck_unitree_g1_with_hands",
                     "t_action",
                     "action_low_level_unitree_g1_with_hands",
+                    "force_hand_left_unitree_g1_with_hands",
+                    "force_hand_right_unitree_g1_with_hands",
                 ]
 
                 data_dict_keys = [
@@ -199,6 +207,8 @@ def main(args):
                     "action_neck",
                     "t_action",
                     "action_low_level",
+                    "force_hand_left",
+                    "force_hand_right",
                 ]
 
                 try:
@@ -258,7 +268,10 @@ def main(args):
         depth_shared_memory.unlink()
         depth_shared_memory.close()
         recorder.close()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
 
         print("Exiting the recording...")
 

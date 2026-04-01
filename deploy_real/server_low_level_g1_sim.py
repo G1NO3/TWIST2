@@ -131,27 +131,27 @@ class RealTimePolicyController:
         ])
 
         self.stiffness = np.array([
-                100, 100, 100, 150, 40, 40,
-                100, 100, 100, 150, 40, 40,
-                150, 150, 150,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
+                100, 100, 100, 150, 40, 40,  # left leg
+                100, 100, 100, 150, 40, 40,  # right leg
+                150, 150, 150,                # waist
+                40, 40, 40, 40, 20, 20, 20,  # left arm (wrist Kp=20, matches real robot)
+                40, 40, 40, 40, 20, 20, 20,  # right arm
             ])
         self.damping = np.array([
-                2, 2, 2, 4, 2, 2,
-                2, 2, 2, 4, 2, 2,
-                4, 4, 4,
-                5, 5, 5, 5, 0.2, 0.2, 0.2,
-                5, 5, 5, 5, 0.2, 0.2, 0.2,
+                2, 2, 2, 4, 2, 2,            # left leg
+                2, 2, 2, 4, 2, 2,            # right leg
+                4, 4, 4,                      # waist
+                5, 5, 5, 5, 1, 1, 1,         # left arm (wrist Kd=1, matches real robot)
+                5, 5, 5, 5, 1, 1, 1,         # right arm
             ])
 
         
         self.torque_limits = np.array([
-                100, 100, 100, 150, 40, 40,
-                100, 100, 100, 150, 40, 40,
-                150, 150, 150,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
-                40, 40, 40, 40, 4.0, 4.0, 4.0,
+                100, 100, 100, 150, 40, 40,  # left leg
+                100, 100, 100, 150, 40, 40,  # right leg
+                150, 150, 150,                # waist
+                40, 40, 40, 40, 20, 20, 20,  # left arm
+                40, 40, 40, 40, 20, 20, 20,  # right arm
             ])
 
         self.action_scale = np.array([
@@ -182,6 +182,10 @@ class RealTimePolicyController:
         self.proprio_history_buf = deque(maxlen=self.history_len)
         for _ in range(self.history_len):
             self.proprio_history_buf.append(np.zeros(self.n_obs_single, dtype=np.float32))
+
+        # Stale data detection
+        self.stale_threshold_ms = 500  # max age of teleop data before considered stale
+        self.stale_count = 0
 
         # Recording
         self.record_video = record_video
@@ -278,90 +282,115 @@ class RealTimePolicyController:
                     self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_pd_target.tolist()))
                     self.redis_pipeline.execute()
 
-                    # Get mimic obs from Redis
-                    keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands", "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands"]
+                    # Get mimic obs from Redis (with staleness check)
+                    keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands",
+                            "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands",
+                            "t_action"]
                     for key in keys:
                         self.redis_pipeline.get(key)
                     redis_results = self.redis_pipeline.execute()
-                    action_mimic = json.loads(redis_results[0])
-                    action_left_hand = json.loads(redis_results[1])
-                    action_right_hand = json.loads(redis_results[2])
-                    action_neck = json.loads(redis_results[3])
 
-                    # Construct observation for TWIST2 controller
-                    obs_full = np.concatenate([action_mimic, obs_proprio])
-                    # Update history
-                    obs_hist = np.array(self.proprio_history_buf).flatten()
-                    self.proprio_history_buf.append(obs_full)
-                    future_obs = action_mimic.copy()
-                    # Combine all observations: current + history + future (set to current frame for now)
-                    obs_buf = np.concatenate([obs_full, obs_hist, future_obs])
-                    
+                    # Check if teleop data exists and is fresh
+                    use_new_data = redis_results[0] is not None
+                    if use_new_data:
+                        t_action_raw = redis_results[4]
+                        if t_action_raw is not None:
+                            t_action = int(t_action_raw)
+                            t_now_ms = int(time.time() * 1000)
+                            age_ms = t_now_ms - t_action
+                            if age_ms > self.stale_threshold_ms:
+                                use_new_data = False
+                                self.stale_count += 1
+                                if self.stale_count % 50 == 1:
+                                    print(f"[WARN] Stale teleop data: {age_ms}ms old (threshold={self.stale_threshold_ms}ms), "
+                                          f"holding last target (stale_count={self.stale_count})")
+                            else:
+                                if self.stale_count > 0:
+                                    print(f"[INFO] Teleop data fresh again after {self.stale_count} stale frames")
+                                self.stale_count = 0
 
-                    # Ensure correct total observation size
-                    assert obs_buf.shape[0] == self.total_obs_size, f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
-                    
-                    # Run policy
-                    obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
-                    with torch.no_grad():
-                        raw_action = self.policy(obs_tensor).cpu().numpy().squeeze()
-                    
-                    # Measure and track policy execution FPS
-                    current_time = time.time()
-                    if last_policy_time is not None:
-                        policy_interval = current_time - last_policy_time
-                        current_policy_fps = 1.0 / policy_interval
-                        
-                        # For frequent printing (every 100 steps)  
-                        policy_execution_times.append(policy_interval)
-                        policy_step_count += 1
-                        
-                        # Print policy execution FPS every 100 steps
-                        if policy_step_count % policy_fps_print_interval == 0:
-                            recent_intervals = policy_execution_times[-policy_fps_print_interval:]
-                            avg_interval = np.mean(recent_intervals)
-                            avg_execution_fps = 1.0 / avg_interval
-                            print(f"Policy Execution FPS (last {policy_fps_print_interval} steps): {avg_execution_fps:.2f} Hz (avg interval: {avg_interval*1000:.2f}ms)")
-                        
-                        # For detailed measurement (every 1000 steps)
-                        if measure_fps:
-                            fps_measurements.append(current_policy_fps)
-                            fps_iteration_count += 1
-                            
-                            if fps_iteration_count == fps_measurement_target:
-                                avg_fps = np.mean(fps_measurements)
-                                max_fps = np.max(fps_measurements)
-                                min_fps = np.min(fps_measurements)
-                                std_fps = np.std(fps_measurements)
-                                print(f"\n=== Policy Execution FPS Results (steps {fps_iteration_count-fps_measurement_target+1}-{fps_iteration_count}) ===")
-                                print(f"Average Policy FPS: {avg_fps:.2f}")
-                                print(f"Max Policy FPS: {max_fps:.2f}")
-                                print(f"Min Policy FPS: {min_fps:.2f}")
-                                print(f"Std Policy FPS: {std_fps:.2f}")
-                                print(f"Expected FPS (from decimation): {1.0/(self.sim_decimation * self.sim_dt):.2f}")
-                                print(f"=================================================================================\n")
-                                # Reset for next 1000 measurements
-                                fps_measurements = []
-                                fps_iteration_count = 0
-                    last_policy_time = current_time
-                    
-                    self.last_action = raw_action
-                    raw_action = np.clip(raw_action, -10., 10.)
-                    scaled_actions = raw_action * self.action_scale
-                    pd_target = scaled_actions + self.default_dof_pos
-                    self.last_pd_target = pd_target.copy()
-                    
+                    if not use_new_data:
+                        # Hold the last PD target — skip policy update but still step physics
+                        pd_target = self.last_pd_target
+                    else:
+                        action_mimic = json.loads(redis_results[0])
+                        action_left_hand = json.loads(redis_results[1])
+                        action_right_hand = json.loads(redis_results[2])
+                        action_neck = json.loads(redis_results[3])
+
+                        # Construct observation for TWIST2 controller
+                        obs_full = np.concatenate([action_mimic, obs_proprio])
+                        # Update history
+                        obs_hist = np.array(self.proprio_history_buf).flatten()
+                        self.proprio_history_buf.append(obs_full)
+                        future_obs = action_mimic.copy()
+                        # Combine all observations: current + history + future (set to current frame for now)
+                        obs_buf = np.concatenate([obs_full, obs_hist, future_obs])
+
+                        # Ensure correct total observation size
+                        assert obs_buf.shape[0] == self.total_obs_size, f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
+
+                        # Run policy
+                        obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
+                        with torch.no_grad():
+                            raw_action = self.policy(obs_tensor).cpu().numpy().squeeze()
+
+                        # Measure and track policy execution FPS
+                        current_time = time.time()
+                        if last_policy_time is not None:
+                            policy_interval = current_time - last_policy_time
+                            current_policy_fps = 1.0 / policy_interval
+
+                            # For frequent printing (every 100 steps)
+                            policy_execution_times.append(policy_interval)
+                            policy_step_count += 1
+
+                            # Print policy execution FPS every 100 steps
+                            if policy_step_count % policy_fps_print_interval == 0:
+                                recent_intervals = policy_execution_times[-policy_fps_print_interval:]
+                                avg_interval = np.mean(recent_intervals)
+                                avg_execution_fps = 1.0 / avg_interval
+                                print(f"Policy Execution FPS (last {policy_fps_print_interval} steps): {avg_execution_fps:.2f} Hz (avg interval: {avg_interval*1000:.2f}ms)")
+
+                            # For detailed measurement (every 1000 steps)
+                            if measure_fps:
+                                fps_measurements.append(current_policy_fps)
+                                fps_iteration_count += 1
+
+                                if fps_iteration_count == fps_measurement_target:
+                                    avg_fps = np.mean(fps_measurements)
+                                    max_fps = np.max(fps_measurements)
+                                    min_fps = np.min(fps_measurements)
+                                    std_fps = np.std(fps_measurements)
+                                    print(f"\n=== Policy Execution FPS Results (steps {fps_iteration_count-fps_measurement_target+1}-{fps_iteration_count}) ===")
+                                    print(f"Average Policy FPS: {avg_fps:.2f}")
+                                    print(f"Max Policy FPS: {max_fps:.2f}")
+                                    print(f"Min Policy FPS: {min_fps:.2f}")
+                                    print(f"Std Policy FPS: {std_fps:.2f}")
+                                    print(f"Expected FPS (from decimation): {1.0/(self.sim_decimation * self.sim_dt):.2f}")
+                                    print(f"=================================================================================\n")
+                                    # Reset for next 1000 measurements
+                                    fps_measurements = []
+                                    fps_iteration_count = 0
+                        last_policy_time = current_time
+
+                        self.last_action = raw_action
+                        raw_action = np.clip(raw_action, -10., 10.)
+                        scaled_actions = raw_action * self.action_scale
+                        pd_target = scaled_actions + self.default_dof_pos
+                        self.last_pd_target = pd_target.copy()
+
                     # Update camera to follow pelvis
                     pelvis_pos = self.data.xpos[self.model.body("pelvis").id]
                     self.viewer.cam.lookat = pelvis_pos
                     self.viewer.sync()
-                    
+
                     if mp4_writer is not None:
                         img = self.viewer.read_pixels()
                         mp4_writer.append_data(img)
 
                     # Record proprio if enabled
-                    if self.record_proprio:
+                    if self.record_proprio and use_new_data:
                         proprio_data = {
                             'timestamp': time.time(),
                             'dof_pos': dof_pos.tolist(),

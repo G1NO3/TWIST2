@@ -1,24 +1,25 @@
 """
-Convert TWIST2 demonstration data to LeRobot v2.0 dataset format.
+Convert TWIST2 demonstration data to LeRobot v2.0 dataset format
+with per-frame subtask labels based on hand state transitions.
 
-Supports two action modes:
-  - high_level: teleop target poses (action_body + optional hand/neck)
-  - low_level:  motor commands from RL policy (action_low_level + optional hand)
+Subtask workflow (bottle packing):
+  1. "grasp the bottle"           — until fingers close on bottle
+  2. "place the bottle into the box" — until fingers release bottle
+  3. "close the box"              — until end of episode
+
+Hand state convention (Inspire 6-DOF: [pinky, ring, middle, index, thumb_bend, thumb_rot]):
+  ~1000 = OPEN (fingers extended)
+  ~0    = CLOSED (fingers curled, gripping)
 
 Usage:
-  # Single session:
-  python convert_twist2_to_lerobot.py \
+  python convert_twist2_to_lerobot_subtask.py \
       --data_dir twist2_demonstration/20260210_1017 \
       --output_dir /path/to/output \
       --repo_id "user/dataset_name" \
-      --action_mode high_level
+      --action_mode high_level \
+      --hand_type inspire
 
-  # All sessions in a parent directory:
-  python convert_twist2_to_lerobot.py \
-      --data_dir twist2_demonstration \
-      --output_dir /path/to/output \
-      --repo_id "user/dataset_name" \
-      --action_mode high_level
+Note: Neck state and neck action commands are excluded from the converted dataset.
 """
 
 import argparse
@@ -34,25 +35,78 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # ---------- Dimension constants ----------
 DIM_STATE_BODY = 34       # ang_vel(3) + roll_pitch(2) + dof_pos(29)
-DIM_STATE_NECK = 2
 
 DIM_ACTION_BODY = 35      # high-level teleop target
-DIM_ACTION_NECK = 2
 DIM_ACTION_LOW_LEVEL = 29  # low-level motor commands
 
 HAND_DIM = {'dex3': 7, 'inspire': 6}
 DIM_FORCE_HAND = {'dex3': 7, 'inspire': 6}  # motor current per finger
 
+# ---------- Subtask definitions ----------
+SUBTASKS = [
+    "grasp the bottle",
+    "place the bottle into the box",
+    "close the box",
+]
+
+
+def detect_subtasks(frames, close_thresh=500, open_thresh=700):
+    """Return list of subtask label strings, one per frame.
+
+    Detection logic (Inspire hand, indices 0-3 = pinky/ring/middle/index):
+      - State values: ~1000 = open, ~0 = closed
+      - Transition 1 (grasp): >=3 of 4 fingers of either hand drop below close_thresh
+      - Transition 2 (release): >=3 of 4 fingers of the grasping hand rise above open_thresh
+
+    Returns None if not all transitions are found (episode should be skipped).
+    """
+    current_subtask = 0  # index into SUBTASKS
+    grasp_hand = None    # "left" or "right" once grasp detected
+    labels = []
+
+    for frame in frames:
+        left = frame.get("state_hand_left")
+        right = frame.get("state_hand_right")
+
+        if current_subtask == 0:
+            # Looking for grasp: >=3 of 4 fingers drop below close_thresh
+            for hand_vals, hand_name in [(left, "left"), (right, "right")]:
+                if hand_vals is not None:
+                    fingers = hand_vals[:4]  # pinky, ring, middle, index
+                    closed_count = sum(1 for v in fingers if v < close_thresh)
+                    if closed_count >= 3:
+                        current_subtask = 1
+                        grasp_hand = hand_name
+                        break
+
+        elif current_subtask == 1:
+            # Looking for release: >=3 of 4 fingers of grasping hand rise above open_thresh
+            hand_vals = left if grasp_hand == "left" else right
+            if hand_vals is not None:
+                fingers = hand_vals[:4]
+                open_count = sum(1 for v in fingers if v > open_thresh)
+                if open_count >= 3:
+                    current_subtask = 2
+
+        labels.append(SUBTASKS[current_subtask])
+
+    # All transitions must have been found
+    if current_subtask < 2:
+        return None
+
+    return labels
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Convert TWIST2 data to LeRobot format")
+    parser = argparse.ArgumentParser(
+        description="Convert TWIST2 data to LeRobot format with subtask labels"
+    )
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Path to a single session dir (with episode_XXXX/ folders) "
                              "or a parent dir containing multiple session dirs")
-    parser.add_argument("--task_name", type=str, default="g1 task",
-                        help="Task description string for all episodes")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="Output LeRobot dataset root directory")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output LeRobot dataset root directory "
+                             "(default: ~/.cache/huggingface/lerobot/<repo_id>)")
     parser.add_argument("--repo_id", type=str, required=True,
                         help="HuggingFace repo ID (e.g. user/dataset_name)")
     parser.add_argument("--fps", type=int, default=60,
@@ -75,18 +129,28 @@ def parse_args():
                         help="Push dataset to HuggingFace Hub")
     parser.add_argument("--image_writer_processes", type=int, default=0)
     parser.add_argument("--image_writer_threads", type=int, default=4)
-    parser.add_argument("--hand_type", type=str, default="dex3", choices=["dex3", "inspire"],
-                        help="Hand type: dex3 (7-DOF) or inspire (6-DOF). Must match what was used during recording.")
+    parser.add_argument("--hand_type", type=str, default="inspire", choices=["dex3", "inspire"],
+                        help="Hand type: dex3 (7-DOF) or inspire (6-DOF). Default: inspire")
     parser.add_argument("--include_force", action="store_true", default=False,
-                        help="Include hand force/current data as observation.force (requires force-enabled recordings)")
-    parser.add_argument("--skip_unsuccessful", action="store_true", default=False,
-                        help="Skip episodes whose label contains 'unsuccessful'")
+                        help="Include hand force/current data as observation.force")
+
+    # Subtask detection thresholds
+    parser.add_argument("--close_thresh", type=int, default=500,
+                        help="Finger value below this = closed/gripping (default: 500)")
+    parser.add_argument("--open_thresh", type=int, default=700,
+                        help="Finger value above this = open/released (default: 700)")
 
     args = parser.parse_args()
 
     # Set include_hand default based on action_mode
     if args.include_hand is None:
         args.include_hand = (args.action_mode == "high_level")
+
+    # Default output_dir to HuggingFace cache
+    if args.output_dir is None:
+        args.output_dir = str(
+            Path.home() / ".cache" / "huggingface" / "lerobot" / args.repo_id
+        )
 
     return args
 
@@ -95,7 +159,7 @@ def get_action_dim(action_mode: str, include_hand: bool, hand_dof: int) -> int:
     if action_mode == "high_level":
         dim = DIM_ACTION_BODY
         if include_hand:
-            dim += hand_dof * 2 + DIM_ACTION_NECK
+            dim += hand_dof * 2
         return dim
     else:  # low_level
         dim = DIM_ACTION_LOW_LEVEL
@@ -123,8 +187,7 @@ def build_state(frame: dict, idx: int, hand_dof: int) -> np.ndarray:
     state_body = safe_array(frame.get("state_body"), DIM_STATE_BODY, "state_body", idx)
     hand_left = safe_array(frame.get("state_hand_left"), hand_dof, "state_hand_left", idx)
     hand_right = safe_array(frame.get("state_hand_right"), hand_dof, "state_hand_right", idx)
-    neck = safe_array(frame.get("state_neck"), DIM_STATE_NECK, "state_neck", idx)
-    return np.concatenate([state_body, hand_left, hand_right, neck])
+    return np.concatenate([state_body, hand_left, hand_right])
 
 
 def build_action(frame: dict, idx: int, action_mode: str, include_hand: bool, hand_dof: int) -> np.ndarray:
@@ -134,8 +197,7 @@ def build_action(frame: dict, idx: int, action_mode: str, include_hand: bool, ha
         if include_hand:
             hand_left = safe_array(frame.get("action_hand_left"), hand_dof, "action_hand_left", idx)
             hand_right = safe_array(frame.get("action_hand_right"), hand_dof, "action_hand_right", idx)
-            neck = safe_array(frame.get("action_neck"), DIM_ACTION_NECK, "action_neck", idx)
-            action = np.concatenate([action, hand_left, hand_right, neck])
+            action = np.concatenate([action, hand_left, hand_right])
     else:  # low_level
         action = safe_array(frame.get("action_low_level"), DIM_ACTION_LOW_LEVEL, "action_low_level", idx)
         if include_hand:
@@ -156,7 +218,7 @@ def main():
     args = parse_args()
 
     hand_dof = HAND_DIM[args.hand_type]
-    dim_state = DIM_STATE_BODY + hand_dof * 2 + DIM_STATE_NECK
+    dim_state = DIM_STATE_BODY + hand_dof * 2
     print(f"Hand type: {args.hand_type} ({hand_dof}-DOF per hand)")
 
     data_dir = Path(args.data_dir)
@@ -164,8 +226,7 @@ def main():
         data_dir = Path.cwd() / data_dir
     output_dir = Path(args.output_dir)
 
-    # Discover episodes — supports both a single session dir and a parent
-    # dir containing multiple session subdirs.
+    # Discover episodes
     episode_dirs = sorted([
         d for d in data_dir.iterdir()
         if d.is_dir() and d.name.startswith("episode_")
@@ -173,7 +234,6 @@ def main():
     if episode_dirs:
         print(f"Found {len(episode_dirs)} episodes in {data_dir}")
     else:
-        # Try treating data_dir as a parent of multiple session dirs
         session_dirs = sorted([
             d for d in data_dir.iterdir()
             if d.is_dir() and not d.name.startswith(".")
@@ -204,11 +264,12 @@ def main():
 
     # Compute action dim
     action_dim = get_action_dim(args.action_mode, args.include_hand, hand_dof)
-    dim_force = hand_dof * 2  # left + right
+    dim_force = hand_dof * 2
     print(f"Action mode: {args.action_mode}, include_hand: {args.include_hand}, action_dim: {action_dim}")
     print(f"State dim: {dim_state}")
     if args.include_force:
         print(f"Force dim: {dim_force} (motor current, {hand_dof} per hand)")
+    print(f"Subtask thresholds: close={args.close_thresh}, open={args.open_thresh}")
 
     # Define features
     vision_dtype = "video" if args.use_videos else "image"
@@ -251,23 +312,39 @@ def main():
 
     total_frames = 0
     skipped_episodes = 0
+    skipped_subtask = 0
+    subtask_summary = []  # per-episode subtask frame counts
 
     for ep_dir in tqdm(episode_dirs, desc="Converting episodes"):
         json_path = ep_dir / "data.json"
         with open(json_path) as f:
             ep_data = json.load(f)
 
-        # Skip unsuccessful episodes if requested
+        # Skip unsuccessful episodes
         label = ep_data.get("label", "")
-        if args.skip_unsuccessful and "unsuccessful" in label:
+        if label == "unsuccessful":
             skipped_episodes += 1
             tqdm.write(f"  Skipped {ep_dir.name}: label={label}")
             continue
 
         frames = ep_data["data"]
+
+        # Detect subtask transitions
+        subtask_labels = detect_subtasks(frames, args.close_thresh, args.open_thresh)
+        if subtask_labels is None:
+            skipped_subtask += 1
+            tqdm.write(f"  Skipped {ep_dir.name}: subtask transitions not all found")
+            continue
+
+        # Count frames per subtask for this episode
+        ep_subtask_counts = {}
+        for st in SUBTASKS:
+            ep_subtask_counts[st] = subtask_labels.count(st)
+        subtask_summary.append((ep_dir.name, ep_subtask_counts))
+
         num_frames = len(frames)
 
-        for frame in frames:
+        for i, frame in enumerate(frames):
             idx = frame["idx"]
 
             # Load RGB image (BGR -> RGB)
@@ -286,7 +363,7 @@ def main():
                 "observation.images.head_rgb": img_rgb,
                 "observation.state": state,
                 "action": action,
-                "task": args.task_name,
+                "task": subtask_labels[i],
             }
 
             if args.include_force:
@@ -295,7 +372,8 @@ def main():
 
         dataset.save_episode()
         total_frames += num_frames
-        tqdm.write(f"  Saved {ep_dir.name}: {num_frames} frames")
+        tqdm.write(f"  Saved {ep_dir.name}: {num_frames} frames "
+                   f"[{ep_subtask_counts[SUBTASKS[0]]}/{ep_subtask_counts[SUBTASKS[1]]}/{ep_subtask_counts[SUBTASKS[2]]}]")
 
     print("Finalizing dataset...")
     dataset.finalize()
@@ -307,7 +385,9 @@ def main():
     # Summary
     print("\n" + "=" * 60)
     print("Conversion complete!")
-    print(f"  Episodes:   {len(episode_dirs) - skipped_episodes} (skipped {skipped_episodes} unsuccessful)")
+    print(f"  Episodes:   {len(episode_dirs) - skipped_episodes - skipped_subtask} converted")
+    print(f"    Skipped (unsuccessful): {skipped_episodes}")
+    print(f"    Skipped (no subtask transitions): {skipped_subtask}")
     print(f"  Frames:     {total_frames}")
     print(f"  State dim:  {dim_state}")
     print(f"  Action dim: {action_dim}")
@@ -316,7 +396,16 @@ def main():
     print(f"  Action mode: {args.action_mode}")
     print(f"  Include hand: {args.include_hand}")
     print(f"  Include force: {args.include_force}")
+    print(f"  Subtask thresholds: close={args.close_thresh}, open={args.open_thresh}")
     print(f"  Output:     {output_dir}")
+
+    # Per-episode subtask breakdown
+    if subtask_summary:
+        print(f"\n{'Episode':<25} {'grasp':>8} {'place':>8} {'close':>8}")
+        print("-" * 51)
+        for ep_name, counts in subtask_summary:
+            print(f"{ep_name:<25} {counts[SUBTASKS[0]]:>8} {counts[SUBTASKS[1]]:>8} {counts[SUBTASKS[2]]:>8}")
+
     print("=" * 60)
 
 

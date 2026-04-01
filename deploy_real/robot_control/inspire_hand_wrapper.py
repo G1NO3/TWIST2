@@ -11,8 +11,8 @@ The Inspire hand has 6 DOF per hand:
   Index 5: Thumb rotation
 
 Commands use angle_set values in range [0, 1000]:
-  0 = fully open
-  1000 = fully closed
+  1000 = fully open
+  0 = fully closed
 
 Network defaults (on Unitree G1 internal network):
   Left hand:  192.168.123.210:6000

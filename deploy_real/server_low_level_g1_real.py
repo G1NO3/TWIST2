@@ -13,6 +13,7 @@ from robot_control.g1_wrapper import G1RealWorldEnv
 from robot_control.config import Config
 import os
 from data_utils.rot_utils import quatToEuler
+from data_utils.params import DEFAULT_MIMIC_OBS
 
 from robot_control.dex_hand_wrapper import Dex3_1_Controller
 from robot_control.inspire_hand_wrapper import InspireHandController
@@ -105,7 +106,8 @@ class RealTimePolicyController(object):
                  inspire_left_ip='192.168.123.210',
                  inspire_right_ip='192.168.123.211',
                  record_proprio=False,
-                 smooth_body=0.0):
+                 smooth_body=0.0,
+                 check_stale=False):
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -167,7 +169,13 @@ class RealTimePolicyController(object):
         
         self.record_proprio = record_proprio
         self.proprio_recordings = [] if record_proprio else None
-        
+
+        # Stale data detection
+        self.check_stale = check_stale
+        self.stale_threshold_ms = 500  # max age of teleop data before considered stale
+        self.stale_count = 0
+        self.last_valid_t_action = None
+
         # Smoothing processing
         self.smooth_body = smooth_body
         if smooth_body > 0.0:
@@ -186,8 +194,23 @@ class RealTimePolicyController(object):
 
         print("Robot will hold default pos. If needed, do other checks here.")
 
+    def _init_redis_default_pose(self):
+        """Write default pose to Redis so action keys are initialized."""
+        default_body = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
+        default_hand = np.full(self.hand_dof, 1000.0, dtype=np.float32)
+        default_neck = [0.0, 0.0]
+
+        self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_body.tolist()))
+        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
+        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
+        self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(default_neck))
+        self.redis_pipeline.set("t_action", str(int(time.time() * 1000)))
+        self.redis_pipeline.execute()
+        print("[INFO] Redis action keys initialized to default pose")
+
     def run(self):
         self.reset_robot()
+        self._init_redis_default_pose()
         print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.")
 
         try:
@@ -244,11 +267,53 @@ class RealTimePolicyController(object):
                 # execute the pipeline once here for setting the keys
                 self.redis_pipeline.execute()
 
-                # 5. 从 Redis 接收模仿观察
-                keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands", "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands"]
+                # 5. 从 Redis 接收模仿观察 (with staleness check)
+                keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands",
+                        "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands",
+                        "t_action"]
                 for key in keys:
                     self.redis_pipeline.get(key)
                 redis_results = self.redis_pipeline.execute()
+
+                # Check if teleop data exists
+                if redis_results[0] is None:
+                    # No teleop data yet, hold default pose
+                    target_dof_pos = self.default_dof_pos.copy()
+                    self.last_target_dof_pos = target_dof_pos
+                    self.env.send_robot_action(target_dof_pos, 1.0, 1.0)
+                    elapsed = time.time() - t_start
+                    if elapsed < self.control_dt:
+                        time.sleep(self.control_dt - elapsed)
+                    continue
+
+                # Check staleness via t_action timestamp (only if enabled)
+                data_is_stale = False
+                if self.check_stale:
+                    t_action_raw = redis_results[4]
+                    if t_action_raw is not None:
+                        t_action = int(t_action_raw)
+                        t_now_ms = int(time.time() * 1000)
+                        age_ms = t_now_ms - t_action
+                        if age_ms > self.stale_threshold_ms:
+                            data_is_stale = True
+                            self.stale_count += 1
+                            if self.stale_count % 50 == 1:
+                                print(f"[WARN] Stale teleop data: {age_ms}ms old (threshold={self.stale_threshold_ms}ms), "
+                                      f"holding last target (stale_count={self.stale_count})")
+                        else:
+                            if self.stale_count > 0:
+                                print(f"[INFO] Teleop data fresh again after {self.stale_count} stale frames")
+                            self.stale_count = 0
+
+                if data_is_stale:
+                    # Hold the last known good target position instead of feeding stale data to policy
+                    target_dof_pos = self.last_target_dof_pos.copy()
+                    self.env.send_robot_action(target_dof_pos, 1.0, 1.0)
+                    elapsed = time.time() - t_start
+                    if elapsed < self.control_dt:
+                        time.sleep(self.control_dt - elapsed)
+                    continue
+
                 action_mimic = json.loads(redis_results[0])
                 action_hand_left = json.loads(redis_results[1])
                 action_hand_right = json.loads(redis_results[2])
@@ -360,7 +425,9 @@ def main():
                         help='Record proprioceptive data')
     parser.add_argument('--smooth_body', type=float, default=0.0,
                         help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
-    
+    parser.add_argument('--check_stale', action='store_true',
+                        help='Enable stale teleop data detection (hold pose when data is too old)')
+
     args = parser.parse_args()
 
     
@@ -385,6 +452,7 @@ def main():
         print(f"  Inspire right IP: {args.inspire_right_ip}")
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Smooth body: {args.smooth_body}")
+    print(f"  Check stale: {args.check_stale}")
     
     # 安全提示
     print("\n" + "="*50)
@@ -406,6 +474,7 @@ def main():
         inspire_right_ip=args.inspire_right_ip,
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
+        check_stale=args.check_stale,
     )
     
     controller.run()

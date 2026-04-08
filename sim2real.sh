@@ -6,7 +6,7 @@ SCRIPT_DIR=$(dirname $(realpath $0))
 ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
 
 # change the network interface name to your own that connects to the robot
-net=enx9c69d329e5f9
+net=enp128s31f6
 
 cd deploy_real
 

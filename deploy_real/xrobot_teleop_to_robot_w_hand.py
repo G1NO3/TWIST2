@@ -225,7 +225,7 @@ class StateMachine:
             right_axis = controller_data.get('RightController', {}).get('axis', [0.0, 0.0])
             if len(right_axis) >= 2:
                 self.hand_right_thumb_bend_position = np.clip(0.5 - right_axis[1] * 0.5, 0.0, 1.0)
-                joystick_thumb_rot = np.clip(0.5 - right_axis[0] * 0.5, 0.0, 1.0)
+                joystick_thumb_rot = np.clip(0.5 + right_axis[0] * 0.5, 0.0, 1.0)
                 if self.grip_thumb:
                     self.hand_right_thumb_position = max(joystick_thumb_rot, 1.0 - float(right_grip_current))
                 else:

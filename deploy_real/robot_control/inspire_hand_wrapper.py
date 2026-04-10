@@ -23,6 +23,7 @@ Dependencies:
 """
 import numpy as np
 import struct
+import threading
 import time
 from enum import IntEnum
 
@@ -80,6 +81,12 @@ class InspireHandController:
         """
         Initialize Inspire hand controller via Modbus TCP.
 
+        After initialization, two daemon worker threads (one per hand) take
+        over all Modbus I/O. The public methods (`ctrl_dual_hand`,
+        `get_hand_state`, `get_hand_all_state`) become non-blocking: they
+        buffer commands and return cached state snapshots. This keeps the
+        50 Hz main control loop insulated from Modbus latency/jitter.
+
         Args:
             left_ip: IP address of the left Inspire hand
             right_ip: IP address of the right Inspire hand
@@ -112,7 +119,7 @@ class InspireHandController:
             self.left_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
             self.right_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
 
-        # State arrays
+        # State arrays (updated by worker threads under _state_lock)
         self.left_hand_state_array = np.zeros(Inspire_Num_Motors, dtype=np.float32)
         self.right_hand_state_array = np.zeros(Inspire_Num_Motors, dtype=np.float32)
         self.Lpos = np.zeros(Inspire_Num_Motors, dtype=np.float32)
@@ -122,13 +129,61 @@ class InspireHandController:
         self.Ltau = np.zeros(Inspire_Num_Motors, dtype=np.float32)
         self.Rtau = np.zeros(Inspire_Num_Motors, dtype=np.float32)
 
-        # Read initial state
-        self.get_hand_state()
+        # --- threading primitives ---
+        # Two independent locks: _cmd_lock protects the command buffer,
+        # _state_lock protects the feedback cache. No method ever holds
+        # both simultaneously, so deadlock is impossible.
+        self._state_lock = threading.Lock()
+        self._cmd_lock = threading.Lock()
+        self._stop_event = threading.Event()
+
+        # Last-wins command buffer. Initialized to the default open pose so
+        # the first write the worker sends matches _bootstrap_write_default_sync.
+        self._target_left = np.array(DEFAULT_QPOS_LEFT, dtype=np.int32)
+        self._target_right = np.array(DEFAULT_QPOS_RIGHT, dtype=np.int32)
+        self._target_dirty_left = False
+        self._target_dirty_right = False
+
+        # Error bookkeeping (protected by _state_lock)
+        self._consec_errors_left = 0
+        self._consec_errors_right = 0
+        self._last_err_log_left = 0.0
+        self._last_err_log_right = 0.0
+
+        # Worker cadence: 50 Hz matches the main control loop.
+        self._worker_period_s = 0.02
+
+        self._worker_left = None
+        self._worker_right = None
+
+        # Read initial state synchronously — must happen before workers start
+        # so that consumers never see zeroed caches and TCP failures raise
+        # from __init__ as they do today.
+        self._bootstrap_read_sync()
         print(f"  Left hand state: {self.left_hand_state_array}")
         print(f"  Right hand state: {self.right_hand_state_array}")
 
         if re_init:
-            self.initialize()
+            self._bootstrap_write_default_sync()
+
+        # Spawn per-hand workers. Each owns its own ModbusTcpClient
+        # exclusively — this avoids any need for a per-client mutex and
+        # lets L and R hand I/O run truly in parallel (separate sockets,
+        # separate IPs, GIL released during socket.recv).
+        self._worker_left = threading.Thread(
+            target=self._worker_loop,
+            args=("left", self.left_client),
+            name="InspireHandWorker-L",
+            daemon=True,
+        )
+        self._worker_right = threading.Thread(
+            target=self._worker_loop,
+            args=("right", self.right_client),
+            name="InspireHandWorker-R",
+            daemon=True,
+        )
+        self._worker_left.start()
+        self._worker_right.start()
 
         print("Initialize InspireHandController OK!\n")
 
@@ -170,13 +225,14 @@ class InspireHandController:
             print(f"Exception reading byte registers at {address}: {e}")
             return [0] * (count * 2)
 
-    def get_hand_state(self):
-        """Read current hand joint angles.
+    def _bootstrap_read_sync(self):
+        """One-shot synchronous read of angle/current/temperature for both hands.
 
-        Returns:
-            (left_hand_state_6d, right_hand_state_6d): numpy arrays of angle values
+        Used only during __init__ before worker threads exist. Populates the
+        feedback cache fields directly (no lock needed — no concurrent readers
+        yet). If TCP is broken, the underlying read helpers return zeros and
+        log an error, matching the legacy behavior.
         """
-        # Read angle_act (signed int16, 6 values per hand)
         left_angles = self._read_registers_signed(self.left_client, REG_ANGLE_ACT, 6)
         right_angles = self._read_registers_signed(self.right_client, REG_ANGLE_ACT, 6)
 
@@ -185,56 +241,268 @@ class InspireHandController:
         self.Lpos = self.left_hand_state_array.copy()
         self.Rpos = self.right_hand_state_array.copy()
 
-        # Read motor current (proxy for torque estimation)
         left_current = self._read_registers_signed(self.left_client, REG_CURRENT, 6)
         right_current = self._read_registers_signed(self.right_client, REG_CURRENT, 6)
         self.Ltau = np.array(left_current, dtype=np.float32)
         self.Rtau = np.array(right_current, dtype=np.float32)
 
-        # Read temperature (byte-packed: 3 registers -> 6 bytes)
         left_temp = self._read_registers_bytes(self.left_client, REG_TEMPERATURE, 3)
         right_temp = self._read_registers_bytes(self.right_client, REG_TEMPERATURE, 3)
         self.Ltemp = np.array(left_temp[:Inspire_Num_Motors], dtype=np.float32)
         self.Rtemp = np.array(right_temp[:Inspire_Num_Motors], dtype=np.float32)
 
-        return self.left_hand_state_array.copy(), self.right_hand_state_array.copy()
+    def _bootstrap_write_default_sync(self):
+        """One-shot synchronous write of the default open pose to both hands.
 
-    def get_hand_all_state(self):
-        """Get complete hand telemetry.
+        Used only during __init__ (when re_init=True) and from close(). Must
+        only be called from the main thread when workers are not running.
+        """
+        print("Initializing Inspire hands with default open poses...")
+        left_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_LEFT]
+        right_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_RIGHT]
+        try:
+            self.left_client.write_registers(REG_ANGLE_SET, left_angles, **self._dev_kwargs)
+            self.right_client.write_registers(REG_ANGLE_SET, right_angles, **self._dev_kwargs)
+        except Exception as e:
+            print(f"Error writing default pose to hands: {e}")
+
+    def _note_error(self, side, msg):
+        """Record a Modbus I/O error for `side` and log at most once per 2s."""
+        now = time.monotonic()
+        with self._state_lock:
+            if side == "left":
+                self._consec_errors_left += 1
+                count = self._consec_errors_left
+                last_log = self._last_err_log_left
+            else:
+                self._consec_errors_right += 1
+                count = self._consec_errors_right
+                last_log = self._last_err_log_right
+            should_log = (count == 1) or ((now - last_log) > 2.0)
+            if should_log:
+                if side == "left":
+                    self._last_err_log_left = now
+                else:
+                    self._last_err_log_right = now
+
+        if should_log:
+            print(f"[InspireHandWorker-{side[0].upper()}] error (count={count}): {msg}")
+
+    def _note_ok(self, side):
+        """Reset the error counter for `side` after a successful I/O op."""
+        with self._state_lock:
+            if side == "left":
+                if self._consec_errors_left > 0:
+                    count = self._consec_errors_left
+                    self._consec_errors_left = 0
+                    print(f"[InspireHandWorker-L] recovered after {count} errors")
+            else:
+                if self._consec_errors_right > 0:
+                    count = self._consec_errors_right
+                    self._consec_errors_right = 0
+                    print(f"[InspireHandWorker-R] recovered after {count} errors")
+
+    def _worker_loop(self, side, client):
+        """Background Modbus worker owning one hand's TCP client exclusively.
+
+        Per tick (50 Hz):
+            1. If the command buffer is dirty, write REG_ANGLE_SET.
+            2. Read REG_ANGLE_ACT, REG_CURRENT, REG_TEMPERATURE.
+            3. Commit the new feedback to the cache under _state_lock.
+            4. Deadline-sleep until the next tick (cancellable via stop_event).
+
+        No lock is ever held across a Modbus call.
+        """
+        is_left = (side == "left")
+        period = self._worker_period_s
+        next_tick = time.monotonic()
+
+        while not self._stop_event.is_set():
+            try:
+                # --- 1. Write if dirty (last-wins, drop on error) ---
+                target_to_write = None
+                with self._cmd_lock:
+                    if is_left:
+                        dirty = self._target_dirty_left
+                        if dirty:
+                            target_to_write = self._target_left.tolist()
+                            self._target_dirty_left = False
+                    else:
+                        dirty = self._target_dirty_right
+                        if dirty:
+                            target_to_write = self._target_right.tolist()
+                            self._target_dirty_right = False
+
+                if target_to_write is not None:
+                    try:
+                        client.write_registers(
+                            REG_ANGLE_SET, target_to_write, **self._dev_kwargs)
+                        self._note_ok(side)
+                    except Exception as e:
+                        self._note_error(side, f"write_registers: {e}")
+
+                # --- 2a. Read angle_act ---
+                pos = None
+                try:
+                    angles = self._read_registers_signed(client, REG_ANGLE_ACT, 6)
+                    pos = np.array(angles, dtype=np.float32)
+                    self._note_ok(side)
+                except Exception as e:
+                    self._note_error(side, f"read angle_act: {e}")
+
+                # --- 2b. Read motor current ---
+                tau = None
+                try:
+                    current = self._read_registers_signed(client, REG_CURRENT, 6)
+                    tau = np.array(current, dtype=np.float32)
+                except Exception as e:
+                    self._note_error(side, f"read current: {e}")
+
+                # --- 2c. Read temperature (byte-packed 3 registers -> 6 bytes) ---
+                temp = None
+                try:
+                    temp_raw = self._read_registers_bytes(client, REG_TEMPERATURE, 3)
+                    temp = np.array(temp_raw[:Inspire_Num_Motors], dtype=np.float32)
+                except Exception as e:
+                    self._note_error(side, f"read temperature: {e}")
+
+                # --- 3. Commit cache under _state_lock ---
+                if pos is not None or tau is not None or temp is not None:
+                    with self._state_lock:
+                        if is_left:
+                            if pos is not None:
+                                self.Lpos = pos
+                                self.left_hand_state_array = pos
+                            if tau is not None:
+                                self.Ltau = tau
+                            if temp is not None:
+                                self.Ltemp = temp
+                        else:
+                            if pos is not None:
+                                self.Rpos = pos
+                                self.right_hand_state_array = pos
+                            if tau is not None:
+                                self.Rtau = tau
+                            if temp is not None:
+                                self.Rtemp = temp
+
+            except Exception as e:
+                # Catch-all: a bug in worker code must never silently kill
+                # the thread. Log and continue to the next tick.
+                print(f"[InspireHandWorker-{side[0].upper()}] unexpected error: {e}")
+
+            # --- 4. Deadline sleep, cancellable by stop_event ---
+            next_tick += period
+            now = time.monotonic()
+            remaining = next_tick - now
+            if remaining > 0:
+                if self._stop_event.wait(timeout=remaining):
+                    break
+            else:
+                # Overrun: reset phase so we don't spiral trying to catch up.
+                next_tick = now
+
+    def get_hand_state(self):
+        """Return the most recent cached hand joint angles (non-blocking).
 
         Returns:
-            (Lpos, Rpos, Ltemp, Rtemp, Ltau, Rtau): 6-element arrays each
+            (left_hand_state_6d, right_hand_state_6d): float32 arrays, shape (6,).
         """
-        return (self.Lpos.copy(), self.Rpos.copy(),
-                self.Ltemp.copy(), self.Rtemp.copy(),
-                self.Ltau.copy(), self.Rtau.copy())
+        with self._state_lock:
+            return (self.left_hand_state_array.copy(),
+                    self.right_hand_state_array.copy())
+
+    def get_hand_all_state(self):
+        """Return a snapshot of all cached hand telemetry (non-blocking).
+
+        Returns:
+            (Lpos, Rpos, Ltemp, Rtemp, Ltau, Rtau): float32 arrays, shape (6,) each.
+        """
+        with self._state_lock:
+            return (self.Lpos.copy(), self.Rpos.copy(),
+                    self.Ltemp.copy(), self.Rtemp.copy(),
+                    self.Ltau.copy(), self.Rtau.copy())
+
+    def _coerce_shape(self, arr):
+        """Fit a 1-D array to Inspire_Num_Motors by truncating or zero-padding.
+
+        Upstream publishers may send a different-length array (e.g. the
+        7-element dex3 command format) when the teleop side is configured
+        for a different hand type. Coercing here keeps the main control
+        loop alive regardless of upstream shape.
+        """
+        if arr.shape == (Inspire_Num_Motors,):
+            return arr
+        if arr.size >= Inspire_Num_Motors:
+            return arr[:Inspire_Num_Motors]
+        out = np.zeros(Inspire_Num_Motors, dtype=np.float32)
+        out[:arr.size] = arr
+        return out
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
-        """Send angle commands to both hands.
+        """Buffer the latest angle setpoints for both hands (non-blocking).
+
+        The background worker threads pick up the most recent buffered
+        command within one tick (~20 ms) and push it to the hardware.
+        Identical repeats are filtered so we never put unnecessary traffic
+        on the Modbus link.
+
+        Inputs whose length does not match `Inspire_Num_Motors` are
+        truncated or zero-padded (see `_coerce_shape`). This keeps the
+        50 Hz main control loop from crashing when upstream publishes
+        commands in a different hand format.
 
         Args:
             left_q_target: 6-element array/list of angle setpoints (0-1000 range)
             right_q_target: 6-element array/list of angle setpoints (0-1000 range)
         """
-        left_angles = [int(np.clip(v, 0, 1000)) for v in left_q_target]
-        right_angles = [int(np.clip(v, 0, 1000)) for v in right_q_target]
+        left_arr = np.asarray(left_q_target, dtype=np.float32).flatten()
+        right_arr = np.asarray(right_q_target, dtype=np.float32).flatten()
 
-        try:
-            self.left_client.write_registers(REG_ANGLE_SET, left_angles, **self._dev_kwargs)
-            self.right_client.write_registers(REG_ANGLE_SET, right_angles, **self._dev_kwargs)
-        except Exception as e:
-            print(f"Error writing hand commands: {e}")
+        left_fixed = self._coerce_shape(left_arr)
+        right_fixed = self._coerce_shape(right_arr)
+
+        left_clipped = np.clip(left_fixed, 0, 1000).astype(np.int32)
+        right_clipped = np.clip(right_fixed, 0, 1000).astype(np.int32)
+
+        with self._cmd_lock:
+            if not np.array_equal(left_clipped, self._target_left):
+                self._target_left[:] = left_clipped
+                self._target_dirty_left = True
+            if not np.array_equal(right_clipped, self._target_right):
+                self._target_right[:] = right_clipped
+                self._target_dirty_right = True
 
     def initialize(self):
-        """Move hands to default open position."""
+        """Buffer the default open pose for both hands (API compatibility)."""
         print("Initializing Inspire hands with default open poses...")
         self.ctrl_dual_hand(DEFAULT_QPOS_LEFT, DEFAULT_QPOS_RIGHT)
 
     def close(self):
-        """Send hands to open position and disconnect."""
+        """Stop workers, command default open pose, and disconnect TCP clients.
+
+        Order matters: stop workers and join them before the main thread
+        touches the Modbus clients, otherwise we'd race the worker on the
+        same socket.
+        """
+        self._stop_event.set()
+
+        for worker, label in ((self._worker_left, "L"), (self._worker_right, "R")):
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    print(f"[InspireHandController] warning: "
+                          f"worker {label} did not exit within 1s")
+
+        # Workers stopped — main thread now owns both clients again.
         try:
-            self.ctrl_dual_hand(DEFAULT_QPOS_LEFT, DEFAULT_QPOS_RIGHT)
-            time.sleep(0.5)
+            self._bootstrap_write_default_sync()
+            time.sleep(0.5)  # let actuators physically start opening
+        except Exception as e:
+            print(f"[InspireHandController] warning: "
+                  f"default-pose write on close failed: {e}")
+
+        try:
             self.left_client.close()
             self.right_client.close()
             print("Inspire hand connections closed.")

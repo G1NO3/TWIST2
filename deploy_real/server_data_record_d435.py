@@ -193,6 +193,9 @@ def main(args):
                     "action_low_level_unitree_g1_with_hands",
                     "force_hand_left_unitree_g1_with_hands",
                     "force_hand_right_unitree_g1_with_hands",
+                    "tactile_hand_left_unitree_g1_with_hands",
+                    "tactile_hand_right_unitree_g1_with_hands",
+                    "effort_body_unitree_g1_with_hands",
                 ]
 
                 data_dict_keys = [
@@ -209,6 +212,9 @@ def main(args):
                     "action_low_level",
                     "force_hand_left",
                     "force_hand_right",
+                    "tactile_hand_left",
+                    "tactile_hand_right",
+                    "effort_body",
                 ]
 
                 try:
@@ -286,8 +292,8 @@ if __name__ == "__main__":
     parser.add_argument("--robot", default="unitree_g1", choices=["unitree_g1"], help="Robot name")
     parser.add_argument("--robot_ip", default="192.168.123.164", help="Robot / Orin IP")
     parser.add_argument("--camera_port", default=5555, type=int, help="ZMQ port for D435i streamer")
-    parser.add_argument("--width", default=424, type=int, help="Image width")
-    parser.add_argument("--height", default=240, type=int, help="Image height")
+    parser.add_argument("--width", default=1280, type=int, help="Image width")
+    parser.add_argument("--height", default=720, type=int, help="Image height")
 
     # Task description metadata
     parser.add_argument("--goal", default="pick up the red cup", help="Task goal description")

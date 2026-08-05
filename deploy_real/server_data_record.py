@@ -153,6 +153,11 @@ def main(args):
 
                     "force_hand_left_unitree_g1_with_hands",
                     "force_hand_right_unitree_g1_with_hands",
+
+                    "tactile_hand_left_unitree_g1_with_hands",
+                    "tactile_hand_right_unitree_g1_with_hands",
+
+                    "effort_body_unitree_g1_with_hands",
                 ]
 
                 data_dict_keys = [
@@ -170,6 +175,11 @@ def main(args):
 
                     "force_hand_left",
                     "force_hand_right",
+
+                    "tactile_hand_left",
+                    "tactile_hand_right",
+
+                    "effort_body",
                 ]
                 
                 try:

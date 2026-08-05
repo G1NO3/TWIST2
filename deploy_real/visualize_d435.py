@@ -66,14 +66,14 @@ def main():
         ax_depth = None
 
     # Initialize with blank images (424x240 default)
-    blank_rgb = np.zeros((240, 424, 3), dtype=np.uint8)
+    blank_rgb = np.zeros((480, 848, 3), dtype=np.uint8)
     im_rgb = ax_rgb.imshow(blank_rgb)
     ax_rgb.set_title("D435i RGB")
     ax_rgb.axis('off')
 
     im_depth = None
     if show_depth and ax_depth is not None:
-        blank_depth = np.zeros((240, 424), dtype=np.float32)
+        blank_depth = np.zeros((480, 848), dtype=np.float32)
         im_depth = ax_depth.imshow(blank_depth, cmap='jet', vmin=0, vmax=args.max_depth_mm)
         ax_depth.set_title("D435i Depth")
         ax_depth.axis('off')

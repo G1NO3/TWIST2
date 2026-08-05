@@ -138,11 +138,13 @@ class StateMachine:
         # Hand state - interpolation values (0.0 = open, 1.0 = closed)
         self.hand_left_position = 0.0  # 0.0 = fully open, 1.0 = fully closed (Dex3)
         self.hand_right_position = 0.0
-        # Inspire split control: separate finger (4 DOF) and thumb (2 DOF)
-        self.hand_left_finger_position = 0.0
+        # Inspire split control: fingers (3 DOF), index (1 DOF) and thumb (2 DOF)
+        self.hand_left_finger_position = 0.0  # pinky, ring, middle
+        self.hand_left_index_position = 0.0
         self.hand_left_thumb_position = 0.0
         self.hand_left_thumb_bend_position = 1.0  # 1.0 = fully bent (1000), 0.0 = open (0)
-        self.hand_right_finger_position = 0.0
+        self.hand_right_finger_position = 0.0  # pinky, ring, middle
+        self.hand_right_index_position = 0.0
         self.hand_right_thumb_position = 0.0
         self.hand_right_thumb_bend_position = 1.0  # 1.0 = fully bent (1000), 0.0 = open (0)
         self.use_pinch = use_pinch
@@ -179,7 +181,7 @@ class StateMachine:
         right_key_current = controller_data.get('RightController', {}).get('key_one', False)
         left_key_current = controller_data.get('LeftController', {}).get('key_one', False)
         
-        # Hand control - index_trig for close, grip for open
+        # Hand control - Inspire: grip for 3 fingers, index_trig for index (Dex3: index_trig close, grip open)
         right_index_trig_current = controller_data.get('RightController', {}).get('index_trig', False)
         left_index_trig_current = controller_data.get('LeftController', {}).get('index_trig', False)
         right_grip_current = controller_data.get('RightController', {}).get('grip', False)
@@ -213,13 +215,16 @@ class StateMachine:
         # Handle hand control
         if self.hand_type == 'inspire':
             # Inspire: proportional analog control
-            # Trigger (index_trig) = 4 fingers
+            # Side grip = pinky, ring, middle
+            # Back trigger (index_trig) = index finger
             # Each joystick controls its respective hand's thumb:
             #   X axis = thumb rotation, Y axis = thumb bend
             # --grip_thumb flag: grip button also controls thumb rotation
-            # Invert PICO input: trigger 1.0 (pressed) → position 0.0 (closed)
-            self.hand_right_finger_position = 1.0 - float(right_index_trig_current)
-            self.hand_left_finger_position = 1.0 - float(left_index_trig_current)
+            # Invert PICO input: pressed 1.0 → position 0.0 (closed)
+            self.hand_right_finger_position = 1.0 - float(right_grip_current)
+            self.hand_left_finger_position = 1.0 - float(left_grip_current)
+            self.hand_right_index_position = 1.0 - float(right_index_trig_current)
+            self.hand_left_index_position = 1.0 - float(left_index_trig_current)
 
             # Right joystick → right thumb
             right_axis = controller_data.get('RightController', {}).get('axis', [0.0, 0.0])
@@ -366,20 +371,24 @@ class StateMachine:
             return left_pose, right_pose
 
         # Inspire RH56DFTP: 1000 = open, 0 = closed
-        # trigger pressed (1.0) → close (0), released (0.0) → open (1000)
+        # pressed (1.0) → close (0), released (0.0) → open (1000)
         if self.hand_type == 'inspire':
             l_finger = self.hand_left_finger_position * 1000
+            l_index = self.hand_left_index_position * 1000
             l_thumb = self.hand_left_thumb_position * 1000
             l_thumb_bend = self.hand_left_thumb_bend_position * 1000
             r_finger = self.hand_right_finger_position * 1000
+            r_index = self.hand_right_index_position * 1000
             r_thumb = self.hand_right_thumb_position * 1000
             r_thumb_bend = self.hand_right_thumb_bend_position * 1000
             left_pose = np.array([
-                l_finger, l_finger, l_finger, l_finger,  # pinky, ring, middle, index
+                l_finger, l_finger, l_finger,  # pinky, ring, middle (side grip)
+                l_index,                       # index (back trigger)
                 l_thumb_bend, l_thumb,                       # thumb bend (joystick), thumb rotation
             ], dtype=np.float32)
             right_pose = np.array([
-                r_finger, r_finger, r_finger, r_finger,  # pinky, ring, middle, index
+                r_finger, r_finger, r_finger,  # pinky, ring, middle (side grip)
+                r_index,                       # index (back trigger)
                 r_thumb_bend, r_thumb,                       # thumb bend (joystick), thumb rotation
             ], dtype=np.float32)
             return left_pose, right_pose
@@ -1053,7 +1062,7 @@ def parse_arguments():
     parser.add_argument(
         "--grip_thumb",
         action="store_true",
-        help="Also use grip button for thumb rotation (combined with joystick). Default: joystick-only thumb control.",
+        help="Also use grip button for thumb rotation (combined with joystick). Note: for Inspire hands the grip already drives pinky/ring/middle, so this couples them to the thumb. Default: joystick-only thumb control.",
         default=False,
     )
     return parser.parse_args()

@@ -4,8 +4,9 @@ sudo ufw disable
 python xrobot_teleop_to_robot_w_hand.py --robot unitree_g1
 
 State Machine Controls:
-- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...
-- Left controller key_one: Exit program from any state
+- Right controller key_one (A): Cycle through idle -> teleop -> pause -> teleop...
+- Right controller key_two (B): Hold ~1s to exit program from any state
+- Left controller key_one (X): Toggle fine (precision) mode for Inspire hands
 - Left controller axis_click: Emergency stop - kills sim2real.sh process
 - Left controller axis: Control root xy velocity and yaw velocity
 - Right controller axis: Fine-tune root xy velocity and yaw velocity
@@ -111,7 +112,8 @@ def extract_mimic_obs_whole_body(qpos, last_qpos, dt=1/30):
 
 class StateMachine:
     def __init__(self, enable_smooth=False, smooth_window_size=5, use_pinch=False,
-                 use_finger_tracking=False, hand_type='dex3', grip_thumb=False):
+                 use_finger_tracking=False, hand_type='dex3', grip_thumb=False,
+                 fine_span=250.0, thumb_rate=500.0):
         """
         State process for teleoperation:
         idle -> teleop -> pause -> teleop ... -> idle -> exit
@@ -121,6 +123,10 @@ class StateMachine:
         self.right_key_one_was_pressed = False
         self.left_key_one_was_pressed = False
         self.left_axis_click_was_pressed = False
+        # Exit (right key_two / B) requires a deliberate hold, not a tap - B sits
+        # under the manipulating thumb next to A, so a stray press must not end the run.
+        self.exit_hold_seconds = 1.0
+        self._right_key_two_press_time = None
         # Interpolation state
         self.is_interpolating = False
         self.interpolation_start_time = None
@@ -141,12 +147,26 @@ class StateMachine:
         # Inspire split control: fingers (3 DOF), index (1 DOF) and thumb (2 DOF)
         self.hand_left_finger_position = 0.0  # pinky, ring, middle
         self.hand_left_index_position = 0.0
-        self.hand_left_thumb_position = 0.0
-        self.hand_left_thumb_bend_position = 1.0  # 1.0 = fully bent (1000), 0.0 = open (0)
+        # Thumbs are rate-controlled accumulators, not absolute stick reads: 0.5 is
+        # the mid pose the centred stick used to command, so rest behaviour is unchanged.
+        self.hand_left_thumb_position = 0.5
+        self.hand_left_thumb_bend_position = 0.5
         self.hand_right_finger_position = 0.0  # pinky, ring, middle
         self.hand_right_index_position = 0.0
-        self.hand_right_thumb_position = 0.0
-        self.hand_right_thumb_bend_position = 1.0  # 1.0 = fully bent (1000), 0.0 = open (0)
+        self.hand_right_thumb_position = 0.5
+        self.hand_right_thumb_bend_position = 0.5
+
+        # Fine (precision) mode - toggled by left key_one (X)
+        self.fine_mode = False
+        self.fine_span = float(fine_span)      # counts of finger travel per full lever sweep
+        self.thumb_rate_coarse = float(thumb_rate)  # counts/sec at full stick deflection
+        self.thumb_deadzone = 0.12             # rejects stick miscentring drift
+        # Per-channel state for the analog levers (grip = 3 fingers, trigger = index)
+        self._chan_pos = {}         # last commanded position, 0..1
+        self._fine_anchor = {}      # (anchor_pos, anchor_raw) latched on entering fine mode
+        self._takeover_pending = {} # after leaving fine mode, hold until coarse curve crosses
+        self._prev_coarse = {}
+        self._last_update_time = None
         self.use_pinch = use_pinch
         self.grip_thumb = grip_thumb  # Whether grip button also controls thumb rotation
         # Hand control parameters (Dex3 step-based)
@@ -172,14 +192,86 @@ class StateMachine:
         self.smooth_window_size = smooth_window_size
         self.smooth_history = []  # Store recent observations for sliding window
 
+    def _set_fine_mode(self, enabled):
+        """Toggle fine mode, arming the anchors (on) or soft takeover (off)."""
+        if enabled == self.fine_mode:
+            return
+        self.fine_mode = enabled
+        if enabled:
+            # Anchors latch on the next sample, so engaging never moves a finger.
+            self._fine_anchor = {}
+        else:
+            # Returning to the absolute curve would jump; hold each finger until the
+            # coarse curve sweeps back through it (soft takeover).
+            for ch in self._chan_pos:
+                self._takeover_pending[ch] = True
+                self._prev_coarse[ch] = None
+        if enabled:
+            print(f"[Hand] Fine mode ON (span {self.fine_span:.0f} counts)")
+        else:
+            print("[Hand] Fine mode OFF")
+
+    def _map_lever(self, channel, raw):
+        """Map a 0..1 grip/trigger reading to a 0..1 finger position.
+
+        Coarse is the absolute curve (pressed -> closed). Fine anchors on the position
+        and lever value at engagement and applies a reduced gain from there, so control
+        resumes exactly where it stopped instead of snapping to a remapped range.
+        """
+        raw = float(raw)
+        coarse = 1.0 - raw
+
+        if self.fine_mode:
+            if channel not in self._fine_anchor:
+                self._fine_anchor[channel] = (self._chan_pos.get(channel, coarse), raw)
+            anchor_pos, anchor_raw = self._fine_anchor[channel]
+            gain = self.fine_span / 1000.0
+            pos = min(max(anchor_pos - (raw - anchor_raw) * gain, 0.0), 1.0)
+            # Ratchet: re-anchor at the lever end stops so travel isn't capped at one window.
+            if raw <= 1e-3 or raw >= 1.0 - 1e-3:
+                self._fine_anchor[channel] = (pos, raw)
+        elif self._takeover_pending.get(channel, False):
+            held = self._chan_pos.get(channel, coarse)
+            prev = self._prev_coarse.get(channel)
+            if prev is not None and (prev - held) * (coarse - held) <= 0.0:
+                self._takeover_pending[channel] = False  # curve crossed - reattach
+                pos = coarse
+            else:
+                pos = held
+            self._prev_coarse[channel] = coarse
+        else:
+            pos = coarse
+
+        self._chan_pos[channel] = pos
+        return pos
+
+    def _integrate_thumb(self, current, signed_input, dt):
+        """Rate-control a thumb axis: deflection commands speed, centred holds position."""
+        v = float(signed_input)
+        if dt <= 0.0 or abs(v) < self.thumb_deadzone:
+            return current
+        # Rescale past the deadzone so motion eases in from zero rather than stepping.
+        magnitude = (abs(v) - self.thumb_deadzone) / (1.0 - self.thumb_deadzone)
+        rate = self.thumb_rate_coarse * (self.fine_span / 1000.0) if self.fine_mode \
+            else self.thumb_rate_coarse
+        delta = (1.0 if v > 0 else -1.0) * magnitude * (rate / 1000.0) * dt
+        return min(max(current + delta, 0.0), 1.0)
+
     def update(self, controller_data):
         """Update state machine with controller data"""
         # Store previous state
         self.previous_state = self.state
         
+        # Loop dt for rate-controlled axes (clamped so a stall can't fling the thumbs)
+        now = time.time()
+        dt = 0.0 if self._last_update_time is None \
+            else min(max(now - self._last_update_time, 0.0), 0.1)
+        self._last_update_time = now
+
         # Get current button states
         right_key_current = controller_data.get('RightController', {}).get('key_one', False)
         left_key_current = controller_data.get('LeftController', {}).get('key_one', False)
+        right_key_two_current = controller_data.get('RightController', {}).get('key_two', False)
         
         # Hand control - Inspire: grip for 3 fingers, index_trig for index (Dex3: index_trig close, grip open)
         right_index_trig_current = controller_data.get('RightController', {}).get('index_trig', False)
@@ -199,12 +291,21 @@ class StateMachine:
         if left_axis_click_just_pressed:
             self._emergency_stop()
 
-        # Handle left key press - exit from any state
+        # Handle right key_two (B) - exit, but only on a deliberate hold
+        if right_key_two_current:
+            if self._right_key_two_press_time is None:
+                self._right_key_two_press_time = now
+            elif now - self._right_key_two_press_time >= self.exit_hold_seconds:
+                self.state = "exit"
+        else:
+            self._right_key_two_press_time = None
+
+        # Handle left key press (X) - toggle fine mode
         if left_key_just_pressed:
-            self.state = "exit"
+            self._set_fine_mode(not self.fine_mode)
 
         # Handle right key press - cycle between idle, teleop, pause
-        elif right_key_just_pressed:
+        if self.state != "exit" and right_key_just_pressed:
             if self.state == "idle":
                 self.state = "teleop"
             elif self.state == "teleop":
@@ -220,31 +321,34 @@ class StateMachine:
             # Each joystick controls its respective hand's thumb:
             #   X axis = thumb rotation, Y axis = thumb bend
             # --grip_thumb flag: grip button also controls thumb rotation
-            # Invert PICO input: pressed 1.0 → position 0.0 (closed)
-            self.hand_right_finger_position = 1.0 - float(right_grip_current)
-            self.hand_left_finger_position = 1.0 - float(left_grip_current)
-            self.hand_right_index_position = 1.0 - float(right_index_trig_current)
-            self.hand_left_index_position = 1.0 - float(left_index_trig_current)
+            # Invert PICO input: pressed 1.0 → position 0.0 (closed).
+            # Fine mode anchors each lever so precision control resumes where it stopped.
+            self.hand_right_finger_position = self._map_lever('right_fingers', right_grip_current)
+            self.hand_left_finger_position = self._map_lever('left_fingers', left_grip_current)
+            self.hand_right_index_position = self._map_lever('right_index', right_index_trig_current)
+            self.hand_left_index_position = self._map_lever('left_index', left_index_trig_current)
 
-            # Right joystick → right thumb
+            # Right joystick → right thumb (rate control: centred stick holds position)
             right_axis = controller_data.get('RightController', {}).get('axis', [0.0, 0.0])
             if len(right_axis) >= 2:
-                self.hand_right_thumb_bend_position = np.clip(0.5 - right_axis[1] * 0.5, 0.0, 1.0)
-                joystick_thumb_rot = np.clip(0.5 + right_axis[0] * 0.5, 0.0, 1.0)
+                self.hand_right_thumb_bend_position = self._integrate_thumb(
+                    self.hand_right_thumb_bend_position, -right_axis[1], dt)
+                self.hand_right_thumb_position = self._integrate_thumb(
+                    self.hand_right_thumb_position, right_axis[0], dt)
                 if self.grip_thumb:
-                    self.hand_right_thumb_position = max(joystick_thumb_rot, 1.0 - float(right_grip_current))
-                else:
-                    self.hand_right_thumb_position = joystick_thumb_rot
+                    self.hand_right_thumb_position = max(
+                        self.hand_right_thumb_position, 1.0 - float(right_grip_current))
 
-            # Left joystick → left thumb
+            # Left joystick → left thumb (sign on rotation mirrors the right hand)
             left_axis = controller_data.get('LeftController', {}).get('axis', [0.0, 0.0])
             if len(left_axis) >= 2:
-                self.hand_left_thumb_bend_position = np.clip(0.5 - left_axis[1] * 0.5, 0.0, 1.0)
-                joystick_thumb_rot = np.clip(0.5 - left_axis[0] * 0.5, 0.0, 1.0)
+                self.hand_left_thumb_bend_position = self._integrate_thumb(
+                    self.hand_left_thumb_bend_position, -left_axis[1], dt)
+                self.hand_left_thumb_position = self._integrate_thumb(
+                    self.hand_left_thumb_position, -left_axis[0], dt)
                 if self.grip_thumb:
-                    self.hand_left_thumb_position = max(joystick_thumb_rot, 1.0 - float(left_grip_current))
-                else:
-                    self.hand_left_thumb_position = joystick_thumb_rot
+                    self.hand_left_thumb_position = max(
+                        self.hand_left_thumb_position, 1.0 - float(left_grip_current))
         else:
             # Dex3: step-based interpolation (original behavior)
             # Right hand control
@@ -514,6 +618,8 @@ class XRobotTeleopToRobot:
             use_finger_tracking=self.use_finger_tracking,
             hand_type=self.hand_type,
             grip_thumb=args.grip_thumb,
+            fine_span=getattr(args, 'fine_span', 250.0),
+            thumb_rate=getattr(args, 'thumb_rate', 500.0),
         )
         self.rate = None
         
@@ -898,8 +1004,9 @@ class XRobotTeleopToRobot:
             print("- FINGER TRACKING MODE: Hand poses from Pico hand tracking")
             print("- Keyboard control by separate operator (see terminal prompts)")
         else:
-            print("- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...")
-            print("- Left controller key_one: Exit program")
+            print("- Right controller key_one (A): Cycle through idle -> teleop -> pause -> teleop...")
+            print("- Right controller key_two (B): HOLD ~1s to exit program")
+            print("- Left controller key_one (X): Toggle fine (precision) mode")
             print("- Left controller axis_click: Emergency stop - kills sim2real.sh process")
         print("- Left controller axis: Control root xy velocity")
         print("- Right controller axis: Control yaw velocity")
@@ -1058,6 +1165,21 @@ def parse_arguments():
         action="store_true",
         help="Use Pico 4 Ultra finger tracking for Inspire hand control instead of controller buttons.",
         default=False,
+    )
+    parser.add_argument(
+        "--fine_span",
+        type=float,
+        default=250.0,
+        help="Inspire fine mode: counts of finger travel per full grip/trigger sweep "
+             "(1000 = same as coarse). Lower is finer; below ~100 you hit the hand's "
+             "own mechanical resolution. Toggled in-headset with left X.",
+    )
+    parser.add_argument(
+        "--thumb_rate",
+        type=float,
+        default=500.0,
+        help="Inspire thumb rate control: counts/sec at full stick deflection. "
+             "Scaled by fine_span/1000 while fine mode is active.",
     )
     parser.add_argument(
         "--grip_thumb",

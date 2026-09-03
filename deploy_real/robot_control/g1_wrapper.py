@@ -138,7 +138,8 @@ class G1RealWorldEnv:
         return (dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol)
     
 
-    def send_robot_action(self, target_dof_pos, kp_scale=1.0, kd_scale=1.0):
+    def send_robot_action(self, target_dof_pos, kp_scale=1.0, kd_scale=1.0,
+                          tau_ff=None, kp_motor_scale=None, kd_motor_scale=None):
         
         # Read current state to get current positions for uncontrolled joints
         current_state = self.read_robot_state()
@@ -146,11 +147,20 @@ class G1RealWorldEnv:
         
         cmd.q_target = target_dof_pos.copy()
         cmd.dq_target = np.zeros_like(target_dof_pos)
-        kps = [self.config.kps[i] * kp_scale for i in range(len(self.config.kps))]
-        kds = [self.config.kds[i] * kd_scale for i in range(len(self.config.kds))]
+        # Optional PER-MOTOR gain multipliers (HIL right-arm override
+        # stiffening).  None keeps the original global-scale behaviour.
+        _kpm = np.ones(len(self.config.kps)) if kp_motor_scale is None \
+            else np.asarray(kp_motor_scale, dtype=np.float64)
+        _kdm = np.ones(len(self.config.kds)) if kd_motor_scale is None \
+            else np.asarray(kd_motor_scale, dtype=np.float64)
+        kps = [self.config.kps[i] * kp_scale * _kpm[i] for i in range(len(self.config.kps))]
+        kds = [self.config.kds[i] * kd_scale * _kdm[i] for i in range(len(self.config.kds))]
         cmd.kp = kps
         cmd.kd = kds
-        cmd.tau_ff = np.zeros_like(target_dof_pos)
+        # Optional per-motor feedforward torque (HIL right-arm override
+        # gravity hold).  None keeps the original zero-tau behaviour.
+        cmd.tau_ff = (np.zeros_like(target_dof_pos) if tau_ff is None
+                      else np.asarray(tau_ff, dtype=target_dof_pos.dtype))
         self.send_cmd(cmd)
         return
         

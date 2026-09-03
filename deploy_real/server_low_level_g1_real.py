@@ -11,6 +11,13 @@ from collections import deque
 
 from robot_control.g1_wrapper import G1RealWorldEnv
 from robot_control.config import Config
+from robot_control.hil_remote import (
+    REDIS_HEARTBEAT_KEY as HIL_REMOTE_HEARTBEAT_KEY,
+    REDIS_REMOTE_KEY as HIL_REMOTE_KEY,
+    key_pressed,
+    remote_snapshot,
+)
+from robot_control.joint_command_safety import JointCommandSafety
 import os
 from data_utils.rot_utils import quatToEuler
 from data_utils.params import DEFAULT_MIMIC_OBS
@@ -107,7 +114,11 @@ class RealTimePolicyController(object):
                  inspire_right_ip='192.168.123.211',
                  record_proprio=False,
                  smooth_body=0.0,
-                 check_stale=False):
+                 check_stale=False,
+                 hil_safety=False,
+                 safety_urdf=None,
+                 safety_velocity_scale=0.10,
+                 safety_position_margin=0.02):
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -171,10 +182,15 @@ class RealTimePolicyController(object):
         self.proprio_recordings = [] if record_proprio else None
 
         # Stale data detection
-        self.check_stale = check_stale
+        # HIL never permits opt-out from stale-reference detection.  The
+        # actor publishes at 10 Hz; 500 ms still tolerates several missed
+        # actions while bounding how long a dead writer can remain effective.
+        self.hil_safety = bool(hil_safety)
+        self.check_stale = bool(check_stale or hil_safety)
         self.stale_threshold_ms = 500  # max age of teleop data before considered stale
         self.stale_count = 0
         self.last_valid_t_action = None
+        self.remote_invalid_count = 0
 
         # Smoothing processing
         self.smooth_body = smooth_body
@@ -183,6 +199,57 @@ class RealTimePolicyController(object):
             print(f"Body action smoothing enabled with alpha={smooth_body}")
         else:
             self.body_smoother = None
+
+        self._last_measured_q = None
+        self.command_safety = None
+        if self.hil_safety:
+            if not safety_urdf:
+                raise ValueError("safety_urdf is required with hil_safety")
+            self.command_safety = JointCommandSafety(
+                safety_urdf, self.control_dt,
+                velocity_scale=safety_velocity_scale,
+                position_margin_rad=safety_position_margin)
+            print("HIL joint safety ENABLED: URDF position limits + "
+                  f"{safety_velocity_scale:.3f}x URDF velocity slew")
+
+    def _send_robot_action(self, requested, kp_scale=1.0, kd_scale=1.0):
+        """The sole body command path; publishes the exact post-safety target."""
+        raw = np.asarray(requested, dtype=np.float32).reshape(-1)
+        diagnostic = None
+        if self.command_safety is not None:
+            diagnostic = self.command_safety.filter(
+                raw, measured_q=self._last_measured_q)
+            target = diagnostic.target
+        else:
+            target = raw
+        self.last_target_dof_pos = target.copy()
+        self.env.send_robot_action(target, kp_scale, kd_scale)
+        if diagnostic is not None:
+            stamp = int(time.time() * 1000)
+            self.redis_pipeline.set(
+                "action_raw_low_level_unitree_g1_with_hands",
+                json.dumps(raw.tolist()))
+            self.redis_pipeline.set(
+                "action_safe_low_level_unitree_g1_with_hands",
+                json.dumps(target.tolist()))
+            # Backward-compatible key now also means what was actually sent.
+            self.redis_pipeline.set(
+                "action_low_level_unitree_g1_with_hands",
+                json.dumps(target.tolist()))
+            self.redis_pipeline.set("t_action_safe_low_level", stamp)
+            self.redis_pipeline.set(
+                "action_safe_low_level_diagnostics",
+                json.dumps({
+                    "valid": diagnostic.valid,
+                    "reason": diagnostic.reason,
+                    "position_clipped": diagnostic.position_clipped,
+                    "velocity_clipped": diagnostic.velocity_clipped,
+                    "max_requested_step_rad": diagnostic.max_requested_step_rad,
+                    "max_applied_step_rad": diagnostic.max_applied_step_rad,
+                    "timestamp_ms": stamp,
+                }))
+            self.redis_pipeline.execute()
+        return target
 
         
     def reset_robot(self):
@@ -217,21 +284,52 @@ class RealTimePolicyController(object):
             while True:
                 t_start = time.time()
 
-                # Send remote control signals to Redis for motion server
+                # The robot host is the sole DDS reader for the physical
+                # remote.  Read it once per 50 Hz cycle, then fan out one
+                # coherent snapshot through Redis to motion/HIL consumers.
+                remote = self.env.read_controller_input()
+                remote_keys = int(remote.keys)
+
+                # Send remote control signals to Redis for motion server.
                 if self.redis_client:
                     # Send B button status (for motion start)
-                    b_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["B"]
-                    self.redis_client.set("motion_start_signal", "1" if b_pressed else "0")
+                    b_pressed = key_pressed(
+                        remote_keys, self.env.controller_mapping["B"])
+                    self.redis_client.set(
+                        "motion_start_signal", "1" if b_pressed else "0")
                     
                     # Send Select button status (for motion exit)
-                    select_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["select"]
-                    self.redis_client.set("motion_exit_signal", "1" if select_pressed else "0")
+                    select_pressed = key_pressed(
+                        remote_keys, self.env.controller_mapping["select"])
+                    self.redis_client.set(
+                        "motion_exit_signal", "1" if select_pressed else "0")
+
+                    if self.hil_safety:
+                        stamp = int(time.time() * 1000)
+                        try:
+                            snapshot = remote_snapshot(remote, stamp)
+                        except (AttributeError, TypeError, ValueError) as exc:
+                            # Do not refresh the heartbeat with an invalid
+                            # sample.  The actor will enter HOLD after 250 ms.
+                            self.remote_invalid_count += 1
+                            if self.remote_invalid_count % 50 == 1:
+                                print("[WARN] Invalid Unitree remote sample: "
+                                      f"{exc} (count={self.remote_invalid_count})")
+                        else:
+                            self.remote_invalid_count = 0
+                            self.redis_pipeline.set(
+                                HIL_REMOTE_KEY, json.dumps(
+                                    snapshot, separators=(",", ":")))
+                            self.redis_pipeline.set(
+                                HIL_REMOTE_HEARTBEAT_KEY, stamp)
                     
-                if self.env.read_controller_input().keys == self.env.controller_mapping["select"]:
+                if key_pressed(remote_keys,
+                               self.env.controller_mapping["select"]):
                     print("Select pressed, exiting main loop.")
                     break
                 
                 dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
+                self._last_measured_q = np.asarray(dof_pos, dtype=np.float32).copy()
                 
                 rpy = quatToEuler(quat)
 
@@ -303,10 +401,13 @@ class RealTimePolicyController(object):
 
                 # Check if teleop data exists
                 if redis_results[0] is None:
-                    # No teleop data yet, hold default pose
-                    target_dof_pos = self.default_dof_pos.copy()
-                    self.last_target_dof_pos = target_dof_pos
-                    self.env.send_robot_action(target_dof_pos, 1.0, 1.0)
+                    # During HIL, absence must HOLD; returning to the default
+                    # pose would itself be an unrequested motion.  Preserve
+                    # legacy startup behaviour outside the opt-in HIL mode.
+                    target_dof_pos = (self.last_target_dof_pos.copy()
+                                      if self.hil_safety
+                                      else self.default_dof_pos.copy())
+                    self._send_robot_action(target_dof_pos, 1.0, 1.0)
                     elapsed = time.time() - t_start
                     if elapsed < self.control_dt:
                         time.sleep(self.control_dt - elapsed)
@@ -316,7 +417,10 @@ class RealTimePolicyController(object):
                 data_is_stale = False
                 if self.check_stale:
                     t_action_raw = redis_results[4]
-                    if t_action_raw is not None:
+                    if t_action_raw is None:
+                        data_is_stale = True
+                        self.stale_count += 1
+                    else:
                         t_action = int(t_action_raw)
                         t_now_ms = int(time.time() * 1000)
                         age_ms = t_now_ms - t_action
@@ -334,7 +438,7 @@ class RealTimePolicyController(object):
                 if data_is_stale:
                     # Hold the last known good target position instead of feeding stale data to policy
                     target_dof_pos = self.last_target_dof_pos.copy()
-                    self.env.send_robot_action(target_dof_pos, 1.0, 1.0)
+                    self._send_robot_action(target_dof_pos, 1.0, 1.0)
                     elapsed = time.time() - t_start
                     if elapsed < self.control_dt:
                         time.sleep(self.control_dt - elapsed)
@@ -377,11 +481,10 @@ class RealTimePolicyController(object):
 
                 raw_action = np.clip(raw_action, -10.0, 10.0)
                 target_dof_pos = self.default_dof_pos + raw_action * self.action_scale
-                self.last_target_dof_pos = target_dof_pos.copy()
 
                 kp_scale = 1.0
                 kd_scale = 1.0
-                self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
+                self._send_robot_action(target_dof_pos, kp_scale, kd_scale)
                 
                 if self.use_hand:
                     self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
@@ -453,6 +556,16 @@ def main():
                         help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
     parser.add_argument('--check_stale', action='store_true',
                         help='Enable stale teleop data detection (hold pose when data is too old)')
+    parser.add_argument('--hil_safety', action='store_true',
+                        help='Enable final URDF joint position/velocity guard; also forces --check_stale')
+    parser.add_argument('--safety_urdf', type=str,
+                        default=os.path.abspath(os.path.join(
+                            os.path.dirname(__file__), '..', 'assets', 'g1',
+                            'g1_29dof_rev_1_0.urdf')))
+    parser.add_argument('--safety_velocity_scale', type=float, default=0.10,
+                        help='Fraction of URDF max velocity allowed per 20ms target step')
+    parser.add_argument('--safety_position_margin', type=float, default=0.02,
+                        help='Radians kept inside each URDF position limit')
 
     args = parser.parse_args()
 
@@ -479,6 +592,7 @@ def main():
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Smooth body: {args.smooth_body}")
     print(f"  Check stale: {args.check_stale}")
+    print(f"  HIL safety: {args.hil_safety}")
     
     # 安全提示
     print("\n" + "="*50)
@@ -501,6 +615,10 @@ def main():
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
         check_stale=args.check_stale,
+        hil_safety=args.hil_safety,
+        safety_urdf=args.safety_urdf,
+        safety_velocity_scale=args.safety_velocity_scale,
+        safety_position_margin=args.safety_position_margin,
     )
     
     controller.run()

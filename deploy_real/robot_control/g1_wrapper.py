@@ -3,6 +3,8 @@ import time
 import unitree_interface
 from rich import print
 
+from robot_control.hil_remote import key_pressed
+
 ContollerMapping ={
     "A": 0x0100,
     "B": 0x0200,
@@ -83,7 +85,9 @@ class G1RealWorldEnv:
 
     def move_to_default_pos(self):
         print("[green]Waiting for the start signal to move to default pos...[/green]")
-        while self.read_controller_input().keys != self.controller_mapping["start"]:
+        while not key_pressed(
+                self.read_controller_input().keys,
+                self.controller_mapping["start"]):
             time.sleep(self.config.control_dt)
         print("[green]Moving to default pos.[/green]")
         # move time 2s
@@ -102,7 +106,9 @@ class G1RealWorldEnv:
 
     def default_pos_state(self):
         print("Enter default pos state. Waiting for the Button A signal...")
-        while self.read_controller_input().keys != self.controller_mapping["A"]:
+        while not key_pressed(
+                self.read_controller_input().keys,
+                self.controller_mapping["A"]):
             # keep the default pos
             default_pos = self.config.default_angles.copy()
             self.send_robot_action(default_pos)

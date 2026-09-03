@@ -7,6 +7,7 @@ State Machine Controls:
 - Right controller key_one (A): Cycle through idle -> teleop -> pause -> teleop...
 - Right controller key_two (B): Hold ~1s to exit program from any state
 - Left controller key_one (X): Toggle fine (precision) mode for Inspire hands
+- Left controller key_two (Y): Reserved for hold-to-intervene in HIL mode
 - Left controller axis_click: Emergency stop - kills sim2real.sh process
 - Left controller axis: Control root xy velocity and yaw velocity
 - Right controller axis: Fine-tune root xy velocity and yaw velocity
@@ -575,6 +576,17 @@ class StateMachine:
                 print("[EMERGENCY STOP] Successfully killed server_low_level_g1_real_future.py process")
             else:
                 print(f"[EMERGENCY STOP] pkill for server script returned code {result2.returncode}")
+
+            # The fixed-pelvis HIL lane uses a separate launch name and the
+            # current real server (without the historical _future suffix).
+            # Keep the physical Unitree remote as the primary safety device;
+            # these process kills are only the existing software stop path.
+            for pattern in ('sim2real_hil.sh', 'server_low_level_g1_real.py'):
+                result_hil = subprocess.run(
+                    ['pkill', '-f', pattern], capture_output=True,
+                    text=True, timeout=5)
+                if result_hil.returncode == 0:
+                    print(f"[EMERGENCY STOP] Killed {pattern}")
                 
         except subprocess.TimeoutExpired:
             print("[EMERGENCY STOP] pkill command timed out")
@@ -860,6 +872,12 @@ class XRobotTeleopToRobot:
             
     def send_to_redis(self, mimic_obs, neck_data=None):
         """Send mimic observations to Redis"""
+
+        # HIL actor owns every robot action key.  This process remains the
+        # PICO/controller source only; returning here prevents a last-value-
+        # wins race between teleop and HIL at 100 Hz vs 10 Hz.
+        if self.args.hil_controller_only:
+            return
         
         if self.redis_client is not None and mimic_obs is not None:
             # Expect 35D mimic observations
@@ -888,10 +906,13 @@ class XRobotTeleopToRobot:
     def send_controller_data_to_redis(self, controller_data):
         """Send controller data to Redis"""
         if self.redis_client is not None and controller_data is not None:
-            self.redis_client.set(
-                f"controller_data", 
-                json.dumps(controller_data)
-            )
+            self.redis_pipeline.set("controller_data", json.dumps(controller_data))
+            self.redis_pipeline.set("hil:controller_heartbeat_ms",
+                                    int(time.time() * 1000))
+            self.redis_pipeline.set(
+                "hil:controller_mode",
+                "controller_only" if self.args.hil_controller_only else "teleop")
+            self.redis_pipeline.execute()
             
             
     def record_video_frame(self, viewer):
@@ -1062,8 +1083,18 @@ class XRobotTeleopToRobot:
                 # Check if we should exit
                 if self.state_machine.should_exit():
                     print("Exit requested via controller")
-                    self.handle_exit_sequence(viewer)
+                    if not self.args.hil_controller_only:
+                        self.handle_exit_sequence(viewer)
                     break
+
+                if self.args.hil_controller_only:
+                    # The HIL actor consumes only the raw controller dict.
+                    # Do not spend this loop producing, visualising or
+                    # publishing a whole-body retargeting command.
+                    viewer.sync()
+                    self.fps_monitor.tick()
+                    self.rate.sleep()
+                    continue
                 
                 # Process retargeting if we have data
                 qpos, current_retarget_obs = None, None
@@ -1185,6 +1216,14 @@ def parse_arguments():
         "--grip_thumb",
         action="store_true",
         help="Also use grip button for thumb rotation (combined with joystick). Note: for Inspire hands the grip already drives pinky/ring/middle, so this couples them to the thumb. Default: joystick-only thumb control.",
+        default=False,
+    )
+    parser.add_argument(
+        "--hil_controller_only",
+        action="store_true",
+        help="Publish raw PICO controller_data/heartbeat only. Never write "
+             "body, hand, neck or t_action robot command keys; the HIL actor "
+             "must be their sole writer. Left Y is reserved as hold-to-intervene.",
         default=False,
     )
     return parser.parse_args()

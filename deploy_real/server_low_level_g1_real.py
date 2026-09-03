@@ -137,7 +137,8 @@ class RealTimePolicyController(object):
                 self.hand_ctrl = InspireHandController(
                     left_ip=inspire_left_ip,
                     right_ip=inspire_right_ip,
-                    re_init=False)
+                    re_init=False,
+                    open_on_close=not hil_safety)
             else:
                 self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
 
@@ -262,14 +263,32 @@ class RealTimePolicyController(object):
         print("Robot will hold default pos. If needed, do other checks here.")
 
     def _init_redis_default_pose(self):
-        """Write default pose to Redis so action keys are initialized."""
+        """Seed action keys without moving a hand that may hold a tool."""
         default_body = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
-        default_hand = np.full(self.hand_dof, 1000.0, dtype=np.float32)
+        if self.use_hand and self.hand_type == 'inspire':
+            left_hand, right_hand = self.hand_ctrl.current_hold_targets()
+            print("[HIL] Preserving measured Inspire hand positions at "
+                  f"takeover: left={left_hand.tolist()} "
+                  f"right={right_hand.tolist()}")
+        elif self.use_hand:
+            left_hand, right_hand = self.hand_ctrl.get_hand_state()
+            left_hand = np.asarray(
+                left_hand, dtype=np.float32).reshape(self.hand_dof)
+            right_hand = np.asarray(
+                right_hand, dtype=np.float32).reshape(self.hand_dof)
+            if not (np.all(np.isfinite(left_hand))
+                    and np.all(np.isfinite(right_hand))):
+                raise RuntimeError("non-finite hand feedback at takeover")
+        else:
+            # These keys must exist because the host reads/json-decodes them
+            # even when no hand driver is active. They are never actuated.
+            left_hand = np.zeros(self.hand_dof, dtype=np.float32)
+            right_hand = np.zeros(self.hand_dof, dtype=np.float32)
         default_neck = [0.0, 0.0]
 
         self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_body.tolist()))
-        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
-        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
+        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(left_hand.tolist()))
+        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(right_hand.tolist()))
         self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(default_neck))
         self.redis_pipeline.set("t_action", str(int(time.time() * 1000)))
         self.redis_pipeline.execute()

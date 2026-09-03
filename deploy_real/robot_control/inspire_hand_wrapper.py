@@ -130,7 +130,8 @@ DEFAULT_QPOS_RIGHT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["right"]["open"]
 class InspireHandController:
     def __init__(self, left_ip='192.168.123.210', right_ip='192.168.123.211',
                  port=6000, device_id=1, re_init=True,
-                 enable_left=True, enable_right=True):
+                 enable_left=True, enable_right=True,
+                 open_on_close=True):
         """
         Initialize Inspire hand controller via Modbus TCP.
 
@@ -152,12 +153,16 @@ class InspireHandController:
             re_init: Whether to clear errors and move to default position
             enable_left: Connect to and control the left hand (default True)
             enable_right: Connect to and control the right hand (default True)
+            open_on_close: Whether close() deliberately commands the default
+                open pose. Real HIL disables this so Select/Ctrl+C preserves
+                the last grasp instead of releasing the tool.
         """
         if not (enable_left or enable_right):
             raise ValueError("At least one of enable_left/enable_right must be True")
 
         self.enable_left = enable_left
         self.enable_right = enable_right
+        self.open_on_close = bool(open_on_close)
 
         print("Initialize InspireHandController...")
         print(f"  Left hand:  {left_ip}:{port} ({'enabled' if enable_left else 'DISABLED'})")
@@ -212,8 +217,9 @@ class InspireHandController:
         self._cmd_lock = threading.Lock()
         self._stop_event = threading.Event()
 
-        # Last-wins command buffer. Initialized to the default open pose so
-        # the first write the worker sends matches _bootstrap_write_default_sync.
+        # Last-wins command buffer. With re_init=False it is not dirty and
+        # therefore sends nothing until the host supplies a measured hold
+        # target; with re_init=True the explicit bootstrap performs the open.
         self._target_left = np.array(DEFAULT_QPOS_LEFT, dtype=np.int32)
         self._target_right = np.array(DEFAULT_QPOS_RIGHT, dtype=np.int32)
         self._target_dirty_left = False
@@ -273,34 +279,33 @@ class InspireHandController:
 
     def _read_registers_signed(self, client, address, count):
         """Read Modbus registers and interpret as signed int16."""
-        try:
-            response = self._read_holding(client, address, count)
-            if not response.isError():
-                packed = struct.pack('>' + 'H' * count, *response.registers)
-                return list(struct.unpack('>' + 'h' * count, packed))
-            else:
-                print(f"Error reading registers at {address}")
-                return [0] * count
-        except Exception as e:
-            print(f"Exception reading registers at {address}: {e}")
-            return [0] * count
+        response = self._read_holding(client, address, count)
+        if response.isError():
+            raise IOError(f"Modbus error reading registers at {address}")
+        registers = getattr(response, "registers", None)
+        if registers is None or len(registers) != count:
+            got = None if registers is None else len(registers)
+            raise IOError(
+                f"short Modbus read at {address}: expected {count}, got {got}")
+        packed = struct.pack('>' + 'H' * count, *registers)
+        return list(struct.unpack('>' + 'h' * count, packed))
 
     def _read_registers_bytes(self, client, address, count):
         """Read Modbus registers and unpack as individual bytes (2 bytes per register)."""
-        try:
-            response = self._read_holding(client, address, count)
-            if not response.isError():
-                byte_list = []
-                for reg in response.registers:
-                    byte_list.append((reg >> 8) & 0xFF)
-                    byte_list.append(reg & 0xFF)
-                return byte_list
-            else:
-                print(f"Error reading byte registers at {address}")
-                return [0] * (count * 2)
-        except Exception as e:
-            print(f"Exception reading byte registers at {address}: {e}")
-            return [0] * (count * 2)
+        response = self._read_holding(client, address, count)
+        if response.isError():
+            raise IOError(f"Modbus error reading byte registers at {address}")
+        registers = getattr(response, "registers", None)
+        if registers is None or len(registers) != count:
+            got = None if registers is None else len(registers)
+            raise IOError(
+                f"short Modbus byte read at {address}: "
+                f"expected {count}, got {got}")
+        byte_list = []
+        for reg in registers:
+            byte_list.append((reg >> 8) & 0xFF)
+            byte_list.append(reg & 0xFF)
+        return byte_list
 
     def _read_tactile(self, client, prev_buf):
         """Read the full tactile sensor block from one hand.
@@ -342,8 +347,8 @@ class InspireHandController:
 
         Used only during __init__ before worker threads exist. Populates the
         feedback cache fields directly (no lock needed — no concurrent readers
-        yet). If TCP is broken, the underlying read helpers return zeros and
-        log an error, matching the legacy behavior.
+        yet). A broken or short TCP read raises: startup must not publish fake
+        zero feedback, because zero is also a valid fully-closed command.
         """
         if self.enable_left:
             left_angles = self._read_registers_signed(self.left_client, REG_ANGLE_ACT, 6)
@@ -545,6 +550,30 @@ class InspireHandController:
             return (self.left_hand_state_array.copy(),
                     self.right_hand_state_array.copy())
 
+    def current_hold_targets(self):
+        """Return validated measured positions suitable as first commands.
+
+        Inspire feedback and commands share the raw 0..1000 register
+        convention. Returning the measured values makes controller takeover
+        a no-op. Any malformed cache is fatal: startup must never substitute
+        a guessed open/closed pose for a hand holding a tool.
+        """
+        left, right = self.get_hand_state()
+        out = []
+        for side, value in (("left", left), ("right", right)):
+            value = np.asarray(value, dtype=np.float32).reshape(-1)
+            if value.shape != (Inspire_Num_Motors,):
+                raise RuntimeError(
+                    f"invalid {side} Inspire feedback shape {value.shape}")
+            if not np.all(np.isfinite(value)):
+                raise RuntimeError(f"non-finite {side} Inspire feedback")
+            if np.any(value < 0) or np.any(value > 1000):
+                raise RuntimeError(
+                    f"out-of-range {side} Inspire feedback: "
+                    f"{value.tolist()}")
+            out.append(value.copy())
+        return tuple(out)
+
     def get_hand_all_state(self):
         """Return a snapshot of all cached hand telemetry (non-blocking).
 
@@ -615,7 +644,7 @@ class InspireHandController:
         self.ctrl_dual_hand(DEFAULT_QPOS_LEFT, DEFAULT_QPOS_RIGHT)
 
     def close(self):
-        """Stop workers, command default open pose, and disconnect TCP clients.
+        """Stop workers and disconnect, opening only when configured to do so.
 
         Order matters: stop workers and join them before the main thread
         touches the Modbus clients, otherwise we'd race the worker on the
@@ -630,13 +659,19 @@ class InspireHandController:
                     print(f"[InspireHandController] warning: "
                           f"worker {label} did not exit within 1s")
 
-        # Workers stopped — main thread now owns both clients again.
-        try:
-            self._bootstrap_write_default_sync()
-            time.sleep(0.5)  # let actuators physically start opening
-        except Exception as e:
-            print(f"[InspireHandController] warning: "
-                  f"default-pose write on close failed: {e}")
+        # Workers stopped — main thread now owns both clients again. Opening
+        # on close is legacy teleop behaviour, never an acceptable default for
+        # a HIL process whose right hand may be holding a pipette.
+        if self.open_on_close:
+            try:
+                self._bootstrap_write_default_sync()
+                time.sleep(0.5)  # let actuators physically start opening
+            except Exception as e:
+                print(f"[InspireHandController] warning: "
+                      f"default-pose write on close failed: {e}")
+        else:
+            print("[InspireHandController] preserving the last hand "
+                  "setpoints on close")
 
         try:
             if self.left_client is not None:

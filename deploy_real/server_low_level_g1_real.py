@@ -18,6 +18,7 @@ from robot_control.hil_remote import (
     remote_snapshot,
 )
 from robot_control.joint_command_safety import JointCommandSafety
+from robot_control.hil_gravity import decode_right_arm_gravity
 import os
 from data_utils.rot_utils import quatToEuler
 from data_utils.params import DEFAULT_MIMIC_OBS
@@ -203,6 +204,9 @@ class RealTimePolicyController(object):
         self._arm_override_alpha = 0.0
         self._arm_override_q = None
         self._arm_override_logged = False
+        self._arm_gravity_tau = np.zeros(7, dtype=np.float32)
+        self._arm_gravity_alpha = 0.0
+        self._arm_gravity_fresh = False
         self.stale_threshold_ms = 500  # max age of teleop data before considered stale
         self.stale_count = 0
         self.last_valid_t_action = None
@@ -558,6 +562,36 @@ class RealTimePolicyController(object):
                         self._arm_override_alpha = min(_tgt, self._arm_override_alpha + _step)
                     else:
                         self._arm_override_alpha = max(_tgt, self._arm_override_alpha - _step)
+
+                    # Validate gravity feedforward independently on the DDS
+                    # host.  A last-value-wins Redis key can be stale,
+                    # malformed or written by the wrong process; none of
+                    # those cases may reach tau_ff.  Cache the most recent
+                    # valid, host-clipped sample and slew its availability so
+                    # a sidecar failure removes holding torque gradually.
+                    _gravity, _gravity_reason = decode_right_arm_gravity(
+                        redis_results[6], now_ms=_now_ms,
+                        stale_ms=self.arm_override_stale_ms)
+                    _gravity_fresh = _gravity is not None
+                    if _gravity_fresh:
+                        self._arm_gravity_tau = _gravity
+                    _g_tgt = 1.0 if _gravity_fresh else 0.0
+                    if self._arm_gravity_alpha < _g_tgt:
+                        self._arm_gravity_alpha = min(
+                            _g_tgt, self._arm_gravity_alpha + _step)
+                    else:
+                        self._arm_gravity_alpha = max(
+                            _g_tgt, self._arm_gravity_alpha - _step)
+                    if (_gravity_fresh != self._arm_gravity_fresh
+                            and self._arm_override_alpha > 0.0):
+                        if _gravity_fresh:
+                            print("[HIL] gravity feedforward restored — "
+                                  "fading in validated torque")
+                        else:
+                            print("[WARN] gravity feedforward "
+                                  f"{_gravity_reason} — fading to plain PD")
+                    self._arm_gravity_fresh = _gravity_fresh
+
                     if self._arm_override_alpha > 0.0 and self._arm_override_q is not None:
                         a = self._arm_override_alpha
                         target_dof_pos[22:29] = (
@@ -573,18 +607,10 @@ class RealTimePolicyController(object):
                         # the same alpha, staleness-gated like the targets,
                         # and absent-key degrades to plain PD -- never worse
                         # than before.
-                        try:
-                            _gtau = json.loads(redis_results[6]) if redis_results[6] else None
-                        except (TypeError, ValueError):
-                            _gtau = None
-                        if (_gtau is not None
-                                and isinstance(_gtau.get("tau"), list)
-                                and len(_gtau["tau"]) == 14
-                                and (_now_ms - float(_gtau.get("t_ms", 0)))
-                                <= self.arm_override_stale_ms):
+                        if self._arm_gravity_alpha > 0.0:
                             tau_ff = np.zeros(29, dtype=np.float32)
-                            tau_ff[22:29] = a * np.asarray(
-                                _gtau["tau"][7:14], np.float32)
+                            tau_ff[22:29] = (a * self._arm_gravity_alpha
+                                            * self._arm_gravity_tau)
                         # Stiffen ONLY the overridden motors, faded with
                         # the same alpha.  Stock arm kp (40 shoulder / 20
                         # wrist) sags ~0.2 rad under the arm+hand's ~8-10 Nm

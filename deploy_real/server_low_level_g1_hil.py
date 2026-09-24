@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+import argparse
+import signal
+import random
+import time
+import json
+import numpy as np
+import torch
+import redis
+from collections import deque
+# from robot_control.common.remote_controller import KeyMap
+
+from robot_control.g1_wrapper_hil import G1RealWorldEnv
+from robot_control.config import Config
+from robot_control.hil_remote import (
+    REDIS_HEARTBEAT_KEY as HIL_REMOTE_HEARTBEAT_KEY,
+    REDIS_REMOTE_KEY as HIL_REMOTE_KEY,
+    key_pressed,
+    remote_snapshot,
+)
+from robot_control.joint_command_safety import JointCommandSafety
+from robot_control.hil_gravity import decode_right_arm_gravity
+import os
+from data_utils.rot_utils import quatToEuler
+from data_utils.params import DEFAULT_MIMIC_OBS
+
+from robot_control.dex_hand_wrapper import Dex3_1_Controller
+from robot_control.inspire_hand_hil import InspireHandController
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
+
+
+class OnnxPolicyWrapper:
+    """Minimal wrapper so ONNXRuntime policies mimic TorchScript call signature."""
+
+    def __init__(self, session, input_name, output_index=0):
+        self.session = session
+        self.input_name = input_name
+        self.output_index = output_index
+
+    def __call__(self, obs_tensor: torch.Tensor) -> torch.Tensor:
+        if isinstance(obs_tensor, torch.Tensor):
+            obs_np = obs_tensor.detach().cpu().numpy()
+        else:
+            obs_np = np.asarray(obs_tensor, dtype=np.float32)
+        outputs = self.session.run(None, {self.input_name: obs_np})
+        result = outputs[self.output_index]
+        if not isinstance(result, np.ndarray):
+            result = np.asarray(result, dtype=np.float32)
+        return torch.from_numpy(result.astype(np.float32))
+
+
+class EMASmoother:
+    """Exponential Moving Average smoother for body actions."""
+
+    def __init__(self, alpha=0.1, initial_value=None):
+        """
+        Args:
+            alpha: Smoothing factor (0.0=no smoothing, 1.0=maximum smoothing)
+            initial_value: Initial value for smoothing (if None, will use first input)
+        """
+        self.alpha = alpha
+        self.initialized = False
+        self.smoothed_value = initial_value
+
+    def smooth(self, new_value):
+        """Apply EMA smoothing to new value."""
+        if not self.initialized:
+            self.smoothed_value = new_value.copy() if hasattr(new_value, 'copy') else new_value
+            self.initialized = True
+            return self.smoothed_value
+
+        # EMA formula: smoothed = alpha * new + (1 - alpha) * previous
+        self.smoothed_value = self.alpha * new_value + (1 - self.alpha) * self.smoothed_value
+        return self.smoothed_value
+
+    def reset(self):
+        """Reset the smoother to uninitialized state."""
+        self.initialized = False
+        self.smoothed_value = None
+
+
+def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
+    if ort is None:
+        raise ImportError("onnxruntime is required for ONNX policy inference but is not installed.")
+    providers = []
+    available = ort.get_available_providers()
+    if device.startswith('cuda'):
+        if 'CUDAExecutionProvider' in available:
+            providers.append('CUDAExecutionProvider')
+        else:
+            print("CUDAExecutionProvider not available in onnxruntime; falling back to CPUExecutionProvider.")
+    providers.append('CPUExecutionProvider')
+    session = ort.InferenceSession(policy_path, providers=providers)
+    input_name = session.get_inputs()[0].name
+    print(f"ONNX policy loaded from {policy_path} using providers: {session.get_providers()}")
+    return OnnxPolicyWrapper(session, input_name)
+
+
+class RealTimePolicyController(object):
+    """
+    Real robot controller for TWIST2 policy.
+    Based on server_low_level_g1_real.py but adapted for TWIST2 architecture.
+    """
+    def __init__(self,
+                 policy_path,
+                 config_path,
+                 device='cuda',
+                 net='eno1',
+                 use_hand=False,
+                 hand_type='dex3',
+                 inspire_left_ip='192.168.123.210',
+                 inspire_right_ip='192.168.123.211',
+                 record_proprio=False,
+                 smooth_body=0.0,
+                 check_stale=False,
+                 hil_safety=False,
+                 safety_urdf=None,
+                 safety_velocity_scale=0.10,
+                 safety_position_margin=0.02,
+                 arm_override_enabled=True,
+                 arm_override_stale_ms=250.0,
+                 arm_override_fade_s=0.25,
+                 arm_override_kp_scale=3.0,
+                 arm_override_kd_scale=1.7):
+        self.redis_client = None
+        try:
+            self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
+            self.redis_pipeline = self.redis_client.pipeline()
+        except Exception as e:
+            print(f"Error connecting to Redis: {e}")
+            exit()
+
+        self.config = Config(config_path)
+        self.env = G1RealWorldEnv(net=net, config=self.config)
+        self.use_hand = use_hand
+        self.hand_type = hand_type
+        self.hand_dof = 6 if hand_type == 'inspire' else 7
+        if use_hand:
+            if hand_type == 'inspire':
+                self.hand_ctrl = InspireHandController(
+                    left_ip=inspire_left_ip,
+                    right_ip=inspire_right_ip,
+                    re_init=False,
+                    open_on_close=not hil_safety)
+            else:
+                self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
+
+        self.device = device
+        self.policy = load_onnx_policy(policy_path, device)
+
+        self.num_actions = 29
+        self.default_dof_pos = self.config.default_angles
+
+        # scaling factors
+        self.ang_vel_scale = 0.25
+        self.dof_vel_scale = 0.05
+        self.dof_pos_scale = 1.0
+        self.ankle_idx = [4, 5, 10, 11]
+
+        # TWIST2 observation structure
+        self.n_mimic_obs = 35        # 6 + 29 (modified: root_vel_xy + root_pos_z + roll_pitch + yaw_ang_vel + dof_pos)
+        self.n_proprio = 92          # from config analysis
+        self.n_obs_single = 127      # n_mimic_obs + n_proprio = 35 + 92 = 127
+        self.history_len = 10
+
+        self.total_obs_size = self.n_obs_single * (self.history_len + 1) + self.n_mimic_obs  # 127*11 + 35 = 1402
+
+        print(f"TWIST2 Real Controller Configuration:")
+        print(f"  n_mimic_obs: {self.n_mimic_obs}")
+        print(f"  n_proprio: {self.n_proprio}")
+        print(f"  n_obs_single: {self.n_obs_single}")
+        print(f"  history_len: {self.history_len}")
+        print(f"  total_obs_size: {self.total_obs_size}")
+
+        self.proprio_history_buf = deque(maxlen=self.history_len)
+        for _ in range(self.history_len):
+            self.proprio_history_buf.append(np.zeros(self.n_obs_single, dtype=np.float32))
+
+        self.last_action = np.zeros(self.num_actions, dtype=np.float32)
+        self.last_target_dof_pos = self.default_dof_pos.copy()
+
+        self.control_dt = self.config.control_dt
+        self.action_scale = self.config.action_scale
+
+        self.record_proprio = record_proprio
+        self.proprio_recordings = [] if record_proprio else None
+
+        # Stale data detection
+        # HIL never permits opt-out from stale-reference detection.  The
+        # actor publishes at 10 Hz; 500 ms still tolerates several missed
+        # actions while bounding how long a dead writer can remain effective.
+        self.hil_safety = bool(hil_safety)
+        self.check_stale = bool(check_stale or hil_safety)
+
+        # ---- HIL right-arm direct override state (see the control loop) --
+        self.arm_override_enabled = bool(arm_override_enabled)
+        self.arm_override_stale_ms = float(arm_override_stale_ms)
+        self.arm_override_fade_s = float(arm_override_fade_s)
+        self.arm_override_kp_scale = float(arm_override_kp_scale)
+        self.arm_override_kd_scale = float(arm_override_kd_scale)
+        self._arm_override_alpha = 0.0
+        self._arm_override_q = None
+        self._arm_override_logged = False
+        self._arm_gravity_tau = np.zeros(7, dtype=np.float32)
+        self._arm_gravity_alpha = 0.0
+        self._arm_gravity_fresh = False
+        self.stale_threshold_ms = 500  # max age of teleop data before considered stale
+        self.stale_count = 0
+        self.last_valid_t_action = None
+        self.remote_invalid_count = 0
+
+        # Smoothing processing
+        self.smooth_body = smooth_body
+        if smooth_body > 0.0:
+            self.body_smoother = EMASmoother(alpha=smooth_body)
+            print(f"Body action smoothing enabled with alpha={smooth_body}")
+        else:
+            self.body_smoother = None
+
+        self._last_measured_q = None
+        self.command_safety = None
+        if self.hil_safety:
+            if not safety_urdf:
+                raise ValueError("safety_urdf is required with hil_safety")
+            self.command_safety = JointCommandSafety(
+                safety_urdf, self.control_dt,
+                velocity_scale=safety_velocity_scale,
+                position_margin_rad=safety_position_margin)
+            print("HIL joint safety ENABLED: URDF position limits + "
+                  f"{safety_velocity_scale:.3f}x URDF velocity slew")
+
+    def _send_robot_action(self, requested, kp_scale=1.0, kd_scale=1.0,
+                           tau_ff=None, kp_motor_scale=None,
+                           kd_motor_scale=None):
+        """The sole body command path; publishes the exact post-safety target."""
+        raw = np.asarray(requested, dtype=np.float32).reshape(-1)
+        diagnostic = None
+        if self.command_safety is not None:
+            diagnostic = self.command_safety.filter(
+                raw, measured_q=self._last_measured_q)
+            target = diagnostic.target
+        else:
+            target = raw
+        self.last_target_dof_pos = target.copy()
+        self.env.send_robot_action(target, kp_scale, kd_scale, tau_ff=tau_ff,
+                                   kp_motor_scale=kp_motor_scale,
+                                   kd_motor_scale=kd_motor_scale)
+        if diagnostic is not None:
+            stamp = int(time.time() * 1000)
+            self.redis_pipeline.set(
+                "action_raw_low_level_unitree_g1_with_hands",
+                json.dumps(raw.tolist()))
+            self.redis_pipeline.set(
+                "action_safe_low_level_unitree_g1_with_hands",
+                json.dumps(target.tolist()))
+            # Backward-compatible key now also means what was actually sent.
+            self.redis_pipeline.set(
+                "action_low_level_unitree_g1_with_hands",
+                json.dumps(target.tolist()))
+            self.redis_pipeline.set("t_action_safe_low_level", stamp)
+            self.redis_pipeline.set(
+                "action_safe_low_level_diagnostics",
+                json.dumps({
+                    "valid": diagnostic.valid,
+                    "reason": diagnostic.reason,
+                    "position_clipped": diagnostic.position_clipped,
+                    "velocity_clipped": diagnostic.velocity_clipped,
+                    "max_requested_step_rad": diagnostic.max_requested_step_rad,
+                    "max_applied_step_rad": diagnostic.max_applied_step_rad,
+                    "timestamp_ms": stamp,
+                }))
+            self.redis_pipeline.execute()
+        return target
+
+
+    def reset_robot(self):
+        print("Press START on remote to move to default position ...")
+        self.env.move_to_default_pos()
+
+        print("Now in default position, press A to continue ...")
+        self.env.default_pos_state()
+
+        print("Robot will hold default pos. If needed, do other checks here.")
+
+    def _init_redis_default_pose(self):
+        """Seed action keys without moving a hand that may hold a tool."""
+        default_body = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
+        if self.use_hand and self.hand_type == 'inspire':
+            left_hand, right_hand = self.hand_ctrl.current_hold_targets()
+            print("[HIL] Preserving measured Inspire hand positions at "
+                  f"takeover: left={left_hand.tolist()} "
+                  f"right={right_hand.tolist()}")
+        elif self.use_hand:
+            left_hand, right_hand = self.hand_ctrl.get_hand_state()
+            left_hand = np.asarray(
+                left_hand, dtype=np.float32).reshape(self.hand_dof)
+            right_hand = np.asarray(
+                right_hand, dtype=np.float32).reshape(self.hand_dof)
+            if not (np.all(np.isfinite(left_hand))
+                    and np.all(np.isfinite(right_hand))):
+                raise RuntimeError("non-finite hand feedback at takeover")
+        else:
+            # These keys must exist because the host reads/json-decodes them
+            # even when no hand driver is active. They are never actuated.
+            left_hand = np.zeros(self.hand_dof, dtype=np.float32)
+            right_hand = np.zeros(self.hand_dof, dtype=np.float32)
+        default_neck = [0.0, 0.0]
+
+        self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_body.tolist()))
+        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(left_hand.tolist()))
+        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(right_hand.tolist()))
+        self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(default_neck))
+        self.redis_pipeline.set("t_action", str(int(time.time() * 1000)))
+        self.redis_pipeline.execute()
+        print("[INFO] Redis action keys initialized to default pose")
+
+    def run(self):
+        try:
+            self.reset_robot()
+            self._init_redis_default_pose()
+            print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.")
+            while True:
+                t_start = time.time()
+
+                # The robot host is the sole DDS reader for the physical
+                # remote.  Read it once per 50 Hz cycle, then fan out one
+                # coherent snapshot through Redis to motion/HIL consumers.
+                remote = self.env.read_controller_input()
+                remote_keys = int(remote.keys)
+
+                # Send remote control signals to Redis for motion server.
+                if self.redis_client:
+                    # Send B button status (for motion start)
+                    b_pressed = key_pressed(
+                        remote_keys, self.env.controller_mapping["B"])
+                    self.redis_client.set(
+                        "motion_start_signal", "1" if b_pressed else "0")
+
+                    # Send Select button status (for motion exit)
+                    select_pressed = key_pressed(
+                        remote_keys, self.env.controller_mapping["select"])
+                    self.redis_client.set(
+                        "motion_exit_signal", "1" if select_pressed else "0")
+
+                    if self.hil_safety:
+                        stamp = int(time.time() * 1000)
+                        try:
+                            snapshot = remote_snapshot(remote, stamp)
+                        except (AttributeError, TypeError, ValueError) as exc:
+                            # Do not refresh the heartbeat with an invalid
+                            # sample.  The actor will enter HOLD after 250 ms.
+                            self.remote_invalid_count += 1
+                            if self.remote_invalid_count % 50 == 1:
+                                print("[WARN] Invalid Unitree remote sample: "
+                                      f"{exc} (count={self.remote_invalid_count})")
+                        else:
+                            self.remote_invalid_count = 0
+                            self.redis_pipeline.set(
+                                HIL_REMOTE_KEY, json.dumps(
+                                    snapshot, separators=(",", ":")))
+                            self.redis_pipeline.set(
+                                HIL_REMOTE_HEARTBEAT_KEY, stamp)
+
+                if key_pressed(remote_keys,
+                               self.env.controller_mapping["select"]):
+                    print("Select pressed, exiting main loop.")
+                    break
+
+                dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
+                self._last_measured_q = np.asarray(dof_pos, dtype=np.float32).copy()
+
+                rpy = quatToEuler(quat)
+
+                obs_dof_vel = dof_vel.copy()
+                obs_dof_vel[self.ankle_idx] = 0.0
+
+                obs_proprio = np.concatenate([
+                    ang_vel * self.ang_vel_scale,
+                    rpy[:2], # 只使用 roll 和 pitch
+                    (dof_pos - self.default_dof_pos) * self.dof_pos_scale,
+                    obs_dof_vel * self.dof_vel_scale,
+                    self.last_action
+                ])
+
+                state_body = np.concatenate([
+                    ang_vel,
+                    rpy[:2],
+                    dof_pos]) # 3+2+29 = 34 dims
+
+                self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
+
+                # Per-joint estimated torque (29 dims). Already reindexed
+                # into policy joint order by the wrapper's joint2motor_idx,
+                # so effort_body[i] refers to the same joint as
+                # dof_pos[i] -- i.e. state_body[5+i] on the wire, and
+                # state_body[i] after the recorder's joint-first reorder.
+                # Published as its own key rather than appended to
+                # state_body so the 34-dim layout every existing episode
+                # and modality.json index assumes stays valid.
+                self.redis_pipeline.set("effort_body_unitree_g1_with_hands", json.dumps(dof_tau.tolist()))
+
+                if self.use_hand:
+                    left_hand_state, right_hand_state = self.hand_ctrl.get_hand_state()
+                    hand_left_json = json.dumps(left_hand_state.tolist())
+                    hand_right_json = json.dumps(right_hand_state.tolist())
+                    self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", hand_left_json)
+                    self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", hand_right_json)
+
+                    # One consistent snapshot of all hand telemetry. The
+                    # Inspire wrapper returns an 8-tuple (with tactile);
+                    # the dex3 wrapper returns a 6-tuple (no tactile).
+                    all_state = self.hand_ctrl.get_hand_all_state()
+                    lh_pos, rh_pos, lh_temp, rh_temp, lh_tau, rh_tau = all_state[:6]
+                    self.redis_pipeline.set("force_hand_left_unitree_g1_with_hands", json.dumps(lh_tau.tolist()))
+                    self.redis_pipeline.set("force_hand_right_unitree_g1_with_hands", json.dumps(rh_tau.tolist()))
+
+                    # Dense tactile, Inspire-only. Duck-type on the
+                    # attribute so the dex3 path never touches these keys.
+                    if hasattr(self.hand_ctrl, "Ltactile") and len(all_state) >= 8:
+                        lh_tactile, rh_tactile = all_state[6], all_state[7]
+                        self.redis_pipeline.set(
+                            "tactile_hand_left_unitree_g1_with_hands",
+                            json.dumps(lh_tactile.tolist()))
+                        self.redis_pipeline.set(
+                            "tactile_hand_right_unitree_g1_with_hands",
+                            json.dumps(rh_tactile.tolist()))
+
+                self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_target_dof_pos.tolist()))
+                # execute the pipeline once here for setting the keys
+                self.redis_pipeline.execute()
+
+                # 5. 从 Redis 接收模仿观察 (with staleness check)
+                keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands",
+                        "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands",
+                        "t_action", "hil:right_arm_override",
+                        "hil_gravity_tau", "hil:hand_reset"]
+                for key in keys:
+                    self.redis_pipeline.get(key)
+                redis_results = self.redis_pipeline.execute()
+
+                # Check if teleop data exists
+                if redis_results[0] is None:
+                    # During HIL, absence must HOLD; returning to the default
+                    # pose would itself be an unrequested motion.  Preserve
+                    # legacy startup behaviour outside the opt-in HIL mode.
+                    target_dof_pos = (self.last_target_dof_pos.copy()
+                                      if self.hil_safety
+                                      else self.default_dof_pos.copy())
+                    self._send_robot_action(target_dof_pos, 1.0, 1.0)
+                    elapsed = time.time() - t_start
+                    if elapsed < self.control_dt:
+                        time.sleep(self.control_dt - elapsed)
+                    continue
+
+                # Check staleness via t_action timestamp (only if enabled)
+                data_is_stale = False
+                if self.check_stale:
+                    t_action_raw = redis_results[4]
+                    if t_action_raw is None:
+                        data_is_stale = True
+                        self.stale_count += 1
+                    else:
+                        t_action = int(t_action_raw)
+                        t_now_ms = int(time.time() * 1000)
+                        age_ms = t_now_ms - t_action
+                        if age_ms > self.stale_threshold_ms:
+                            data_is_stale = True
+                            self.stale_count += 1
+                            if self.stale_count % 50 == 1:
+                                print(f"[WARN] Stale teleop data: {age_ms}ms old (threshold={self.stale_threshold_ms}ms), "
+                                      f"holding last target (stale_count={self.stale_count})")
+                        else:
+                            if self.stale_count > 0:
+                                print(f"[INFO] Teleop data fresh again after {self.stale_count} stale frames")
+                            self.stale_count = 0
+
+                if data_is_stale:
+                    # Hold the last known good target position instead of feeding stale data to policy
+                    target_dof_pos = self.last_target_dof_pos.copy()
+                    self._send_robot_action(target_dof_pos, 1.0, 1.0)
+                    elapsed = time.time() - t_start
+                    if elapsed < self.control_dt:
+                        time.sleep(self.control_dt - elapsed)
+                    continue
+
+                action_mimic = json.loads(redis_results[0])
+                action_hand_left = json.loads(redis_results[1])
+                action_hand_right = json.loads(redis_results[2])
+                action_neck = json.loads(redis_results[3])
+
+                # Apply smoothing to body actions if enabled
+                if self.body_smoother is not None:
+                    action_mimic = self.body_smoother.smooth(np.array(action_mimic, dtype=np.float32))
+                    action_mimic = action_mimic.tolist()
+
+
+                if self.use_hand:
+                    action_hand_left = np.array(action_hand_left, dtype=np.float32)
+                    action_hand_right = np.array(action_hand_right, dtype=np.float32)
+                else:
+                    action_hand_left = np.zeros(self.hand_dof, dtype=np.float32)
+                    action_hand_right = np.zeros(self.hand_dof, dtype=np.float32)
+
+                obs_full = np.concatenate([action_mimic, obs_proprio])
+
+                obs_hist = np.array(self.proprio_history_buf).flatten()
+                self.proprio_history_buf.append(obs_full)
+
+                future_obs = action_mimic.copy()
+
+                obs_buf = np.concatenate([obs_full, obs_hist, future_obs])
+
+                assert obs_buf.shape[0] == self.total_obs_size, f"Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}"
+
+                obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    raw_action = self.policy(obs_tensor).cpu().numpy().squeeze()
+
+                self.last_action = raw_action.copy()
+
+                raw_action = np.clip(raw_action, -10.0, 10.0)
+                target_dof_pos = self.default_dof_pos + raw_action * self.action_scale
+
+                kp_scale = 1.0
+                kd_scale = 1.0
+
+                # ---- HIL right-arm direct override --------------------------
+                # While the operator intervenes, the actor publishes IK-solved
+                # right-arm joint targets (hil:right_arm_override).  Crossfade
+                # motors 22-28 from the tracker's output onto those targets:
+                # the right arm becomes a plain PD servo on the IK solution
+                # (no tracker steady-state lag) while legs/waist/left arm stay
+                # on the tracker for balance.  FAIL-SAFE BY STALENESS: the
+                # actor deletes the key when not intervening, and anything
+                # older than arm_override_stale_ms fades back to the tracker
+                # over arm_override_fade_s -- entry, exit and actor death are
+                # all slews, never steps.  Downstream _send_robot_action still
+                # applies URDF position limits + velocity slew to the result.
+                tau_ff = None
+                kp_motor_scale = None
+                kd_motor_scale = None
+                if self.arm_override_enabled:
+                    try:
+                        _ovr = json.loads(redis_results[5]) if redis_results[5] else None
+                    except (TypeError, ValueError):
+                        _ovr = None
+                    _now_ms = time.time() * 1000.0
+                    _fresh = (_ovr is not None
+                              and isinstance(_ovr.get("q"), list)
+                              and len(_ovr["q"]) == 7
+                              and (_now_ms - float(_ovr.get("t_ms", 0)))
+                              <= self.arm_override_stale_ms)
+                    if _fresh:
+                        self._arm_override_q = np.asarray(_ovr["q"], np.float32)
+                    _step = self.control_dt / max(self.arm_override_fade_s, self.control_dt)
+                    _tgt = 1.0 if _fresh else 0.0
+                    if self._arm_override_alpha < _tgt:
+                        self._arm_override_alpha = min(_tgt, self._arm_override_alpha + _step)
+                    else:
+                        self._arm_override_alpha = max(_tgt, self._arm_override_alpha - _step)
+
+                    # Validate gravity feedforward independently on the DDS
+                    # host.  A last-value-wins Redis key can be stale,
+                    # malformed or written by the wrong process; none of
+                    # those cases may reach tau_ff.  Cache the most recent
+                    # valid, host-clipped sample and slew its availability so
+                    # a sidecar failure removes holding torque gradually.
+                    _gravity, _gravity_reason = decode_right_arm_gravity(
+                        redis_results[6], now_ms=_now_ms,
+                        stale_ms=self.arm_override_stale_ms)
+                    _gravity_fresh = _gravity is not None
+                    if _gravity_fresh:
+                        self._arm_gravity_tau = _gravity
+                    _g_tgt = 1.0 if _gravity_fresh else 0.0
+                    if self._arm_gravity_alpha < _g_tgt:
+                        self._arm_gravity_alpha = min(
+                            _g_tgt, self._arm_gravity_alpha + _step)
+                    else:
+                        self._arm_gravity_alpha = max(
+                            _g_tgt, self._arm_gravity_alpha - _step)
+                    if (_gravity_fresh != self._arm_gravity_fresh
+                            and self._arm_override_alpha > 0.0):
+                        if _gravity_fresh:
+                            print("[HIL] gravity feedforward restored — "
+                                  "fading in validated torque")
+                        else:
+                            print("[WARN] gravity feedforward "
+                                  f"{_gravity_reason} — fading to plain PD")
+                    self._arm_gravity_fresh = _gravity_fresh
+
+                    if self._arm_override_alpha > 0.0 and self._arm_override_q is not None:
+                        a = self._arm_override_alpha
+                        target_dof_pos[22:29] = (
+                            (1.0 - a) * target_dof_pos[22:29]
+                            + a * self._arm_override_q)
+                        # Gravity feedforward for the position-servoed arm:
+                        # raw IK targets under pure PD sag by gravity/kp (the
+                        # tracker hid this by learning the bias into its own
+                        # targets).  The correction sidecar publishes the
+                        # fitted gravity+bias hold torques continuously on
+                        # hil_gravity_tau; right arm = elements 7:14 of the
+                        # 14-wide arm vector (indexed motor-15).  Faded with
+                        # the same alpha, staleness-gated like the targets,
+                        # and absent-key degrades to plain PD -- never worse
+                        # than before.
+                        if self._arm_gravity_alpha > 0.0:
+                            tau_ff = np.zeros(29, dtype=np.float32)
+                            tau_ff[22:29] = (a * self._arm_gravity_alpha
+                                            * self._arm_gravity_tau)
+                        # Stiffen ONLY the overridden motors, faded with
+                        # the same alpha.  Stock arm kp (40 shoulder / 20
+                        # wrist) sags ~0.2 rad under the arm+hand's ~8-10 Nm
+                        # of gravity; the tracker never showed it because its
+                        # RL policy biases its own targets.  The gravity
+                        # feedforward above is the principled fix; this gain
+                        # scale carries pure-PD sessions (sidecar not
+                        # running) and trims whatever residual the fitted
+                        # model leaves.  Legs/waist/left arm gains are NEVER
+                        # touched -- the tracker was trained against them.
+                        kp_motor_scale = np.ones(29)
+                        kd_motor_scale = np.ones(29)
+                        kp_motor_scale[22:29] = 1.0 + a * (self.arm_override_kp_scale - 1.0)
+                        kd_motor_scale[22:29] = 1.0 + a * (self.arm_override_kd_scale - 1.0)
+                        if not self._arm_override_logged:
+                            print(f"[HIL] right-arm override ENGAGED "
+                                  f"(alpha {a:.2f}) — motors 22-28 on IK targets, "
+                                  f"kp x{self.arm_override_kp_scale:g}"
+                                  + (" + gravity feedforward" if tau_ff is not None
+                                     else " (NO gravity tau — sidecar down? plain PD)"))
+                            self._arm_override_logged = True
+                    elif self._arm_override_logged:
+                        print("[HIL] right-arm override released — tracker owns the arm again")
+                        self._arm_override_logged = False
+
+                self._send_robot_action(target_dof_pos, kp_scale, kd_scale,
+                                        tau_ff=tau_ff,
+                                        kp_motor_scale=kp_motor_scale,
+                                        kd_motor_scale=kd_motor_scale)
+
+                if self.use_hand:
+                    if self.hand_type == 'inspire':
+                        self.hand_ctrl.ctrl_dual_hand(
+                            action_hand_left, action_hand_right,
+                            reset_token=redis_results[7])
+                    else:
+                        self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
+
+                elapsed = time.time() - t_start
+                if elapsed < self.control_dt:
+                    time.sleep(self.control_dt - elapsed)
+
+                if self.record_proprio:
+                    proprio_data = {
+                        'timestamp': time.time(),
+                        'body_dof_pos': dof_pos.tolist(),
+                        'target_dof_pos': action_mimic.tolist()[-29:],
+                        'temperature': dof_temp.tolist(),
+                        'tau': dof_tau.tolist(),
+                        'voltage': dof_vol.tolist(),
+                    }
+
+                    if self.use_hand:
+                        proprio_data['lh_pos'] = lh_pos.tolist()
+                        proprio_data['rh_pos'] = rh_pos.tolist()
+                        proprio_data['lh_temp'] = lh_temp.tolist()
+                        proprio_data['rh_temp'] = rh_temp.tolist()
+                        proprio_data['lh_tau'] = lh_tau.tolist()
+                        proprio_data['rh_tau'] = rh_tau.tolist()
+                    self.proprio_recordings.append(proprio_data)
+
+
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            if self.record_proprio and self.proprio_recordings:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f'logs/twist2_real_recordings_{timestamp}.json'
+                with open(filename, 'w') as f:
+                    json.dump(self.proprio_recordings, f)
+                print(f"Proprioceptive recordings saved as {filename}")
+
+            self.env.close()
+            if self.use_hand:
+                self.hand_ctrl.close()
+            print("TWIST2 real controller finished.")
+
+
+def main():
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
+    parser = argparse.ArgumentParser(description='Run TWIST2 policy on real G1 robot')
+    parser.add_argument('--policy', type=str, required=True,
+                        help='Path to TWIST2 ONNX policy file')
+    parser.add_argument('--config', type=str, default="robot_control/configs/g1.yaml",
+                        help='Path to robot configuration file')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device to run policy on (cuda/cpu)')
+    parser.add_argument('--net', type=str, default='wlp0s20f3',
+                        help='Network interface for robot communication')
+    parser.add_argument('--use_hand', action='store_true',
+                        help='Enable hand control')
+    parser.add_argument('--hand_type', type=str, default='dex3',
+                        choices=['dex3', 'inspire'],
+                        help='Type of dextrous hand (dex3 or inspire)')
+    parser.add_argument('--inspire_left_ip', type=str, default='192.168.123.210',
+                        help='IP address of left Inspire hand')
+    parser.add_argument('--inspire_right_ip', type=str, default='192.168.123.211',
+                        help='IP address of right Inspire hand')
+    parser.add_argument('--record_proprio', action='store_true',
+                        help='Record proprioceptive data')
+    parser.add_argument('--smooth_body', type=float, default=0.0,
+                        help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
+    parser.add_argument('--check_stale', action='store_true',
+                        help='Enable stale teleop data detection (hold pose when data is too old)')
+    parser.add_argument('--no_arm_override', action='store_true',
+                        help='Ignore hil:right_arm_override (right arm stays '
+                             'on the tracker even during HIL interventions)')
+    parser.add_argument('--arm_override_stale_ms', type=float, default=250.0,
+                        help='Override older than this fades back to the tracker')
+    parser.add_argument('--arm_override_fade_s', type=float, default=0.25,
+                        help='Crossfade duration for override engage/release')
+    parser.add_argument('--arm_override_kp_scale', type=float, default=3.0,
+                        help='kp multiplier on motors 22-28 while the IK '
+                             'override is active (shoulder 40 -> 120: cuts '
+                             'pure-PD gravity sag from ~12 deg to ~4)')
+    parser.add_argument('--arm_override_kd_scale', type=float, default=1.7,
+                        help='kd multiplier on motors 22-28 during override '
+                             '(~sqrt(kp scale), keeps damping ratio)')
+    parser.add_argument('--hil_safety', action='store_true',
+                        help='Enable final URDF joint position/velocity guard; also forces --check_stale')
+    parser.add_argument('--safety_urdf', type=str,
+                        default=os.path.abspath(os.path.join(
+                            os.path.dirname(__file__), '..', 'assets', 'g1',
+                            'g1_29dof_rev_1_0.urdf')))
+    parser.add_argument('--safety_velocity_scale', type=float, default=0.10,
+                        help='Fraction of URDF max velocity allowed per 20ms target step')
+    parser.add_argument('--safety_position_margin', type=float, default=0.02,
+                        help='Radians kept inside each URDF position limit')
+
+    args = parser.parse_args()
+
+
+    # 验证文件存在
+    if not os.path.exists(args.policy):
+        print(f"Error: Policy file {args.policy} does not exist")
+        return
+
+    if not os.path.exists(args.config):
+        print(f"Error: Config file {args.config} does not exist")
+        return
+
+    print(f"Starting TWIST2 real robot controller...")
+    print(f"  Policy file: {args.policy}")
+    print(f"  Config file: {args.config}")
+    print(f"  Device: {args.device}")
+    print(f"  Network interface: {args.net}")
+    print(f"  Use hand: {args.use_hand}")
+    print(f"  Hand type: {args.hand_type}")
+    if args.hand_type == 'inspire':
+        print(f"  Inspire left IP: {args.inspire_left_ip}")
+        print(f"  Inspire right IP: {args.inspire_right_ip}")
+    print(f"  Record proprio: {args.record_proprio}")
+    print(f"  Smooth body: {args.smooth_body}")
+    print(f"  Check stale: {args.check_stale}")
+    print(f"  HIL safety: {args.hil_safety}")
+
+    # 安全提示
+    print("\n" + "="*50)
+    print("SAFETY WARNING:")
+    print("You are about to run a policy on a real robot.")
+    print("Make sure the robot is in a safe environment.")
+    print("Press Ctrl+C to stop at any time.")
+    print("Use the remote controller [Select] button to exit.")
+    print("="*50 + "\n")
+
+    controller = RealTimePolicyController(
+        policy_path=args.policy,
+        config_path=args.config,
+        device=args.device,
+        net=args.net,
+        use_hand=args.use_hand,
+        hand_type=args.hand_type,
+        inspire_left_ip=args.inspire_left_ip,
+        inspire_right_ip=args.inspire_right_ip,
+        record_proprio=args.record_proprio,
+        smooth_body=args.smooth_body,
+        check_stale=args.check_stale,
+        hil_safety=args.hil_safety,
+        safety_urdf=args.safety_urdf,
+        safety_velocity_scale=args.safety_velocity_scale,
+        safety_position_margin=args.safety_position_margin,
+        arm_override_enabled=not args.no_arm_override,
+        arm_override_stale_ms=args.arm_override_stale_ms,
+        arm_override_fade_s=args.arm_override_fade_s,
+        arm_override_kp_scale=args.arm_override_kp_scale,
+        arm_override_kd_scale=args.arm_override_kd_scale,
+    )
+
+    controller.run()
+
+
+
+if __name__ == "__main__":
+    main()

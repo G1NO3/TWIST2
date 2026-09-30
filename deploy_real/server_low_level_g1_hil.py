@@ -20,6 +20,7 @@ from robot_control.hil_remote import (
 )
 from robot_control.joint_command_safety import JointCommandSafety
 from robot_control.hil_gravity import decode_right_arm_gravity
+from robot_control.arm_handover import ArmCommand, ArmHandover
 import os
 from data_utils.rot_utils import quatToEuler
 from data_utils.params import DEFAULT_MIMIC_OBS
@@ -202,12 +203,8 @@ class RealTimePolicyController(object):
         self.arm_override_fade_s = float(arm_override_fade_s)
         self.arm_override_kp_scale = float(arm_override_kp_scale)
         self.arm_override_kd_scale = float(arm_override_kd_scale)
-        self._arm_override_alpha = 0.0
-        self._arm_override_q = None
-        self._arm_override_logged = False
-        self._arm_gravity_tau = np.zeros(7, dtype=np.float32)
-        self._arm_gravity_alpha = 0.0
-        self._arm_gravity_fresh = False
+        self.arm_handover = ArmHandover(self.control_dt, self.arm_override_fade_s)
+        self._arm_override_reason = 'inactive'
         self.stale_threshold_ms = 500  # max age of teleop data before considered stale
         self.stale_count = 0
         self.last_valid_t_action = None
@@ -222,6 +219,7 @@ class RealTimePolicyController(object):
             self.body_smoother = None
 
         self._last_measured_q = None
+        self._last_measured_dq = None
         self.command_safety = None
         if self.hil_safety:
             if not safety_urdf:
@@ -235,13 +233,37 @@ class RealTimePolicyController(object):
 
     def _send_robot_action(self, requested, kp_scale=1.0, kd_scale=1.0,
                            tau_ff=None, kp_motor_scale=None,
-                           kd_motor_scale=None):
+                           kd_motor_scale=None, arm_override_active=False):
         """The sole body command path; publishes the exact post-safety target."""
-        raw = np.asarray(requested, dtype=np.float32).reshape(-1)
+        raw = np.asarray(requested, dtype=np.float32).reshape(-1).copy()
         diagnostic = None
+        mixed = None
+        if self.arm_override_enabled:
+            kp_motor_scale = (np.ones(29) if kp_motor_scale is None
+                              else np.asarray(kp_motor_scale).copy())
+            kd_motor_scale = (np.ones(29) if kd_motor_scale is None
+                              else np.asarray(kd_motor_scale).copy())
+            tau_ff = (np.zeros(29) if tau_ff is None else np.asarray(tau_ff).copy())
+            if raw.shape != (29,) or not np.isfinite(raw).all():
+                if self.command_safety is None:
+                    raise ValueError('Invalid motor target without joint safety')
+                diagnostic = self.command_safety.filter(raw, measured_q=self._last_measured_q)
+                raw = diagnostic.target.copy()
+                mixed = (self.arm_handover.last.copy() if self.arm_handover.last is not None
+                         else ArmCommand(raw[22:29], np.ones(7), np.ones(7), np.zeros(7)))
+                self.arm_handover.event = None
+            else:
+                mixed = self.arm_handover.update(ArmCommand(
+                    raw[22:29], kp_scale*kp_motor_scale[22:29],
+                    kd_scale*kd_motor_scale[22:29], tau_ff[22:29]), arm_override_active)
+            raw[22:29] = mixed.q
+            kp_motor_scale[22:29] = mixed.kp/kp_scale
+            kd_motor_scale[22:29] = mixed.kd/kd_scale
+            tau_ff[22:29] = mixed.tau
         if self.command_safety is not None:
-            diagnostic = self.command_safety.filter(
-                raw, measured_q=self._last_measured_q)
+            if diagnostic is None:
+                diagnostic = self.command_safety.filter(
+                    raw, measured_q=self._last_measured_q)
             target = diagnostic.target
         else:
             target = raw
@@ -249,6 +271,26 @@ class RealTimePolicyController(object):
         self.env.send_robot_action(target, kp_scale, kd_scale, tau_ff=tau_ff,
                                    kp_motor_scale=kp_motor_scale,
                                    kd_motor_scale=kd_motor_scale)
+        if mixed is not None:
+            self.arm_handover.record_sent(ArmCommand(
+                target[22:29], mixed.kp, mixed.kd, mixed.tau))
+            if self.arm_handover.event:
+                # Low-volume durable transition records, including the exact
+                # command that reaches DDS after joint safety.
+                print('[HIL] arm handover ' + json.dumps({
+                    'event': self.arm_handover.event,
+                    'timestamp_ms': int(time.time()*1000),
+                    'to': 'direct_pd_gravity' if arm_override_active else 'tracker',
+                    'reason': self._arm_override_reason,
+                    'target_q': target[22:29].tolist(),
+                    'kp_scale': mixed.kp.tolist(), 'kd_scale': mixed.kd.tolist(),
+                    'tau_ff': mixed.tau.tolist(),
+                    'measured_q': (None if self._last_measured_q is None
+                                   else self._last_measured_q[22:29].tolist()),
+                    'measured_dq': (None if self._last_measured_dq is None
+                                    else self._last_measured_dq[22:29].tolist()),
+                    'safety': None if diagnostic is None else diagnostic.reason,
+                }), flush=True)
         if diagnostic is not None:
             stamp = int(time.time() * 1000)
             self.redis_pipeline.set(
@@ -372,6 +414,7 @@ class RealTimePolicyController(object):
 
                 dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
                 self._last_measured_q = np.asarray(dof_pos, dtype=np.float32).copy()
+                self._last_measured_dq = np.asarray(dof_vel, dtype=np.float32).copy()
 
                 rpy = quatToEuler(quat)
 
@@ -444,6 +487,7 @@ class RealTimePolicyController(object):
 
                 # Check if teleop data exists
                 if redis_results[0] is None:
+                    self._arm_override_reason = 'body_reference_missing'
                     # During HIL, absence must HOLD; returning to the default
                     # pose would itself be an unrequested motion.  Preserve
                     # legacy startup behaviour outside the opt-in HIL mode.
@@ -479,6 +523,7 @@ class RealTimePolicyController(object):
                             self.stale_count = 0
 
                 if data_is_stale:
+                    self._arm_override_reason = 'body_reference_stale'
                     # Hold the last known good target position instead of feeding stale data to policy
                     target_dof_pos = self.last_target_dof_pos.copy()
                     self._send_robot_action(target_dof_pos, 1.0, 1.0)
@@ -528,118 +573,40 @@ class RealTimePolicyController(object):
                 kp_scale = 1.0
                 kd_scale = 1.0
 
-                # ---- HIL right-arm direct override --------------------------
-                # While the operator intervenes, the actor publishes IK-solved
-                # right-arm joint targets (hil:right_arm_override).  Crossfade
-                # motors 22-28 from the tracker's output onto those targets:
-                # the right arm becomes a plain PD servo on the IK solution
-                # (no tracker steady-state lag) while legs/waist/left arm stay
-                # on the tracker for balance.  FAIL-SAFE BY STALENESS: the
-                # actor deletes the key when not intervening, and anything
-                # older than arm_override_stale_ms fades back to the tracker
-                # over arm_override_fade_s -- entry, exit and actor death are
-                # all slews, never steps.  Downstream _send_robot_action still
-                # applies URDF position limits + velocity slew to the result.
-                tau_ff = None
-                kp_motor_scale = None
-                kd_motor_scale = None
+                # The desired endpoint is either tracker PD or direct PD +
+                # validated gravity. _send_robot_action owns all handovers,
+                # including the stale-reference hold paths above.
+                tau_ff = kp_motor_scale = kd_motor_scale = None
+                direct_active = False
+                self._arm_override_reason = 'inactive'
                 if self.arm_override_enabled:
                     try:
-                        _ovr = json.loads(redis_results[5]) if redis_results[5] else None
-                    except (TypeError, ValueError):
-                        _ovr = None
-                    _now_ms = time.time() * 1000.0
-                    _fresh = (_ovr is not None
-                              and isinstance(_ovr.get("q"), list)
-                              and len(_ovr["q"]) == 7
-                              and (_now_ms - float(_ovr.get("t_ms", 0)))
-                              <= self.arm_override_stale_ms)
-                    if _fresh:
-                        self._arm_override_q = np.asarray(_ovr["q"], np.float32)
-                    _step = self.control_dt / max(self.arm_override_fade_s, self.control_dt)
-                    _tgt = 1.0 if _fresh else 0.0
-                    if self._arm_override_alpha < _tgt:
-                        self._arm_override_alpha = min(_tgt, self._arm_override_alpha + _step)
-                    else:
-                        self._arm_override_alpha = max(_tgt, self._arm_override_alpha - _step)
-
-                    # Validate gravity feedforward independently on the DDS
-                    # host.  A last-value-wins Redis key can be stale,
-                    # malformed or written by the wrong process; none of
-                    # those cases may reach tau_ff.  Cache the most recent
-                    # valid, host-clipped sample and slew its availability so
-                    # a sidecar failure removes holding torque gradually.
-                    _gravity, _gravity_reason = decode_right_arm_gravity(
-                        redis_results[6], now_ms=_now_ms,
+                        override = json.loads(redis_results[5]) if redis_results[5] else None
+                        q_override = np.asarray(override['q'], dtype=np.float32)
+                        age = time.time()*1000 - float(override['t_ms'])
+                        fresh = (q_override.shape == (7,) and np.isfinite(q_override).all()
+                                 and 0 <= age <= self.arm_override_stale_ms)
+                    except (TypeError, ValueError, KeyError):
+                        fresh = False
+                    gravity, gravity_reason = decode_right_arm_gravity(
+                        redis_results[6], now_ms=time.time()*1000,
                         stale_ms=self.arm_override_stale_ms)
-                    _gravity_fresh = _gravity is not None
-                    if _gravity_fresh:
-                        self._arm_gravity_tau = _gravity
-                    _g_tgt = 1.0 if _gravity_fresh else 0.0
-                    if self._arm_gravity_alpha < _g_tgt:
-                        self._arm_gravity_alpha = min(
-                            _g_tgt, self._arm_gravity_alpha + _step)
-                    else:
-                        self._arm_gravity_alpha = max(
-                            _g_tgt, self._arm_gravity_alpha - _step)
-                    if (_gravity_fresh != self._arm_gravity_fresh
-                            and self._arm_override_alpha > 0.0):
-                        if _gravity_fresh:
-                            print("[HIL] gravity feedforward restored — "
-                                  "fading in validated torque")
-                        else:
-                            print("[WARN] gravity feedforward "
-                                  f"{_gravity_reason} — fading to plain PD")
-                    self._arm_gravity_fresh = _gravity_fresh
-
-                    if self._arm_override_alpha > 0.0 and self._arm_override_q is not None:
-                        a = self._arm_override_alpha
-                        target_dof_pos[22:29] = (
-                            (1.0 - a) * target_dof_pos[22:29]
-                            + a * self._arm_override_q)
-                        # Gravity feedforward for the position-servoed arm:
-                        # raw IK targets under pure PD sag by gravity/kp (the
-                        # tracker hid this by learning the bias into its own
-                        # targets).  The correction sidecar publishes the
-                        # fitted gravity+bias hold torques continuously on
-                        # hil_gravity_tau; right arm = elements 7:14 of the
-                        # 14-wide arm vector (indexed motor-15).  Faded with
-                        # the same alpha, staleness-gated like the targets,
-                        # and absent-key degrades to plain PD -- never worse
-                        # than before.
-                        if self._arm_gravity_alpha > 0.0:
-                            tau_ff = np.zeros(29, dtype=np.float32)
-                            tau_ff[22:29] = (a * self._arm_gravity_alpha
-                                            * self._arm_gravity_tau)
-                        # Stiffen ONLY the overridden motors, faded with
-                        # the same alpha.  Stock arm kp (40 shoulder / 20
-                        # wrist) sags ~0.2 rad under the arm+hand's ~8-10 Nm
-                        # of gravity; the tracker never showed it because its
-                        # RL policy biases its own targets.  The gravity
-                        # feedforward above is the principled fix; this gain
-                        # scale carries pure-PD sessions (sidecar not
-                        # running) and trims whatever residual the fitted
-                        # model leaves.  Legs/waist/left arm gains are NEVER
-                        # touched -- the tracker was trained against them.
-                        kp_motor_scale = np.ones(29)
-                        kd_motor_scale = np.ones(29)
-                        kp_motor_scale[22:29] = 1.0 + a * (self.arm_override_kp_scale - 1.0)
-                        kd_motor_scale[22:29] = 1.0 + a * (self.arm_override_kd_scale - 1.0)
-                        if not self._arm_override_logged:
-                            print(f"[HIL] right-arm override ENGAGED "
-                                  f"(alpha {a:.2f}) — motors 22-28 on IK targets, "
-                                  f"kp x{self.arm_override_kp_scale:g}"
-                                  + (" + gravity feedforward" if tau_ff is not None
-                                     else " (NO gravity tau — sidecar down? plain PD)"))
-                            self._arm_override_logged = True
-                    elif self._arm_override_logged:
-                        print("[HIL] right-arm override released — tracker owns the arm again")
-                        self._arm_override_logged = False
+                    direct_active = fresh and gravity is not None
+                    self._arm_override_reason = ('fresh_override' if direct_active
+                        else 'gravity_' + gravity_reason if fresh else 'override_missing_or_stale')
+                    if direct_active:
+                        target_dof_pos[22:29] = q_override
+                        tau_ff = np.zeros(29, dtype=np.float32)
+                        tau_ff[22:29] = gravity
+                        kp_motor_scale, kd_motor_scale = np.ones(29), np.ones(29)
+                        kp_motor_scale[22:29] = self.arm_override_kp_scale
+                        kd_motor_scale[22:29] = self.arm_override_kd_scale
 
                 self._send_robot_action(target_dof_pos, kp_scale, kd_scale,
                                         tau_ff=tau_ff,
                                         kp_motor_scale=kp_motor_scale,
-                                        kd_motor_scale=kd_motor_scale)
+                                        kd_motor_scale=kd_motor_scale,
+                                        arm_override_active=direct_active)
 
                 if self.use_hand:
                     if self.hand_type == 'inspire':
@@ -724,6 +691,8 @@ def main():
                              'on the tracker even during HIL interventions)')
     parser.add_argument('--arm_override_stale_ms', type=float, default=250.0,
                         help='Override older than this fades back to the tracker')
+    parser.add_argument('--arm_handover_version', type=int, choices=[2], default=2,
+                        help='Explicit process marker for torque-consistent arm handover')
     parser.add_argument('--arm_override_fade_s', type=float, default=0.25,
                         help='Crossfade duration for override engage/release')
     parser.add_argument('--arm_override_kp_scale', type=float, default=3.0,

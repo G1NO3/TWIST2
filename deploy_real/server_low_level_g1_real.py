@@ -124,11 +124,16 @@ class RealTimePolicyController(object):
                  arm_override_stale_ms=250.0,
                  arm_override_fade_s=0.25,
                  arm_override_kp_scale=3.0,
-                 arm_override_kd_scale=1.7):
+                 arm_override_kd_scale=1.7,
+                 motion_start_button_enabled=True):
+        self.motion_start_button_enabled = bool(motion_start_button_enabled)
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
             self.redis_pipeline = self.redis_client.pipeline()
+            if not self.motion_start_button_enabled:
+                # Clear any old B press before initialization waits for START/A.
+                self.redis_client.set("motion_start_signal", "0")
         except Exception as e:
             print(f"Error connecting to Redis: {e}")
             exit()
@@ -276,11 +281,17 @@ class RealTimePolicyController(object):
         return target
 
         
+    def _publish_motion_start(self, remote_keys):
+        """B may be reserved for bridge PAUSE; never emit a start then."""
+        b_pressed = self.motion_start_button_enabled and key_pressed(
+            remote_keys, self.env.controller_mapping["B"])
+        self.redis_client.set("motion_start_signal", "1" if b_pressed else "0")
+
     def reset_robot(self):
-        print("Press START on remote to move to default position ...")
+        print("Press START on remote to move to default position ...", flush=True)
         self.env.move_to_default_pos()
 
-        print("Now in default position, press A to continue ...")
+        print("Now in default position, press A to continue ...", flush=True)
         self.env.default_pos_state()
 
         print("Robot will hold default pos. If needed, do other checks here.")
@@ -320,7 +331,7 @@ class RealTimePolicyController(object):
     def run(self):
         self.reset_robot()
         self._init_redis_default_pose()
-        print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.")
+        print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.", flush=True)
 
         try:
             while True:
@@ -335,10 +346,7 @@ class RealTimePolicyController(object):
                 # Send remote control signals to Redis for motion server.
                 if self.redis_client:
                     # Send B button status (for motion start)
-                    b_pressed = key_pressed(
-                        remote_keys, self.env.controller_mapping["B"])
-                    self.redis_client.set(
-                        "motion_start_signal", "1" if b_pressed else "0")
+                    self._publish_motion_start(remote_keys)
                     
                     # Send Select button status (for motion exit)
                     select_pressed = key_pressed(
@@ -711,6 +719,8 @@ def main():
                         help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
     parser.add_argument('--check_stale', action='store_true',
                         help='Enable stale teleop data detection (hold pose when data is too old)')
+    parser.add_argument('--disable_motion_start_button', action='store_true',
+                        help='Force Redis motion_start_signal to 0; reserve B for bridge PAUSE. START/A unchanged.')
     parser.add_argument('--no_arm_override', action='store_true',
                         help='Ignore hil:right_arm_override (right arm stays '
                              'on the tracker even during HIL interventions)')
@@ -762,6 +772,7 @@ def main():
     print(f"  Smooth body: {args.smooth_body}")
     print(f"  Check stale: {args.check_stale}")
     print(f"  HIL safety: {args.hil_safety}")
+    print(f"  B motion-start button enabled: {not args.disable_motion_start_button}")
     
     # 安全提示
     print("\n" + "="*50)
@@ -784,6 +795,7 @@ def main():
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
         check_stale=args.check_stale,
+        motion_start_button_enabled=not args.disable_motion_start_button,
         hil_safety=args.hil_safety,
         safety_urdf=args.safety_urdf,
         safety_velocity_scale=args.safety_velocity_scale,

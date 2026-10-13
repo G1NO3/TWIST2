@@ -33,6 +33,15 @@ def test_raw_pose_and_button_mapping():
     assert hands["right"]["pose"] == [0., 0., 0., 0., 0., 0., 1.]
 
 
+def test_left_x_and_right_a_keep_raw_button_identity():
+    sdk = SDK()
+    sdk.get_X_button = lambda: True
+    sdk.get_A_button = lambda: True
+    _, hands = source.read_sdk(sdk)
+    assert hands["left"]["key_one"] and hands["right"]["key_one"]
+    assert not hands["left"]["key_two"]
+
+
 def test_incoherent_or_invalid_sample_is_not_published():
     sdk = SDK()
     stamps = iter([123, 124])

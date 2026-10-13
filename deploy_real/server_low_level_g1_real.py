@@ -19,6 +19,7 @@ from robot_control.hil_remote import (
 )
 from robot_control.joint_command_safety import JointCommandSafety
 from robot_control.hil_gravity import decode_right_arm_gravity
+from robot_control.arm_pause import ArmPause, COMMAND_KEY, STATUS_KEY
 import os
 from data_utils.rot_utils import quatToEuler
 from data_utils.params import DEFAULT_MIMIC_OBS
@@ -125,8 +126,11 @@ class RealTimePolicyController(object):
                  arm_override_fade_s=0.25,
                  arm_override_kp_scale=3.0,
                  arm_override_kd_scale=1.7,
-                 motion_start_button_enabled=True):
-        self.motion_start_button_enabled = bool(motion_start_button_enabled)
+                 motion_start_button_enabled=True, bridge_arm_pause=False):
+        self.arm_pause = ArmPause() if bridge_arm_pause else None
+        self._hold_servo = None
+        self._last_arm_servo = None
+        self.motion_start_button_enabled = bool(motion_start_button_enabled) and not bridge_arm_pause
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -242,6 +246,30 @@ class RealTimePolicyController(object):
                            kd_motor_scale=None):
         """The sole body command path; publishes the exact post-safety target."""
         raw = np.asarray(requested, dtype=np.float32).reshape(-1)
+        if self.arm_pause is not None:
+            raw = self.arm_pause.target(raw, time.time() * 1000)
+            if self.arm_pause.held:
+                if self._hold_servo is None:
+                    self._hold_servo = (self._last_arm_servo if self._last_arm_servo is not None
+                                        else (np.zeros(14), np.ones(14), np.ones(14)))
+                # Freeze existing arm feedforward/gains; never freeze the
+                # leg/waist controller or substitute a default arm pose.
+                if self._hold_servo is not None:
+                    tau, kp, kd = self._hold_servo
+                    tau_ff = np.zeros(29) if tau_ff is None else np.array(tau_ff, copy=True)
+                    kp_motor_scale = np.ones(29) if kp_motor_scale is None else np.array(kp_motor_scale, copy=True)
+                    kd_motor_scale = np.ones(29) if kd_motor_scale is None else np.array(kd_motor_scale, copy=True)
+                    tau_ff[15:29], kp_motor_scale[15:29], kd_motor_scale[15:29] = tau, kp, kd
+                if self.command_safety is not None and self.command_safety.previous is not None:
+                    # Discard old arm slew memory too (position clipping
+                    # still applies). Legs/waist safety history is untouched.
+                    self.command_safety.previous[15:29] = self.arm_pause.q
+            else:
+                self._hold_servo = None
+            self._last_arm_servo = (
+                (np.zeros(29) if tau_ff is None else np.asarray(tau_ff))[15:29].copy(),
+                (np.ones(29) if kp_motor_scale is None else np.asarray(kp_motor_scale))[15:29].copy(),
+                (np.ones(29) if kd_motor_scale is None else np.asarray(kd_motor_scale))[15:29].copy())
         diagnostic = None
         if self.command_safety is not None:
             diagnostic = self.command_safety.filter(
@@ -253,6 +281,13 @@ class RealTimePolicyController(object):
         self.env.send_robot_action(target, kp_scale, kd_scale, tau_ff=tau_ff,
                                    kp_motor_scale=kp_motor_scale,
                                    kd_motor_scale=kd_motor_scale)
+        if self.arm_pause is not None:
+            status = self.arm_pause.status(target, time.time() * 1000)
+            status["arm_error_rad"] = float(np.max(np.abs(target[15:29] - self._last_measured_q[15:29])))
+            velocity = getattr(self, "_last_measured_velocity", None)
+            if velocity is not None:
+                status["arm_speed_rad_s"] = float(np.max(np.abs(velocity[15:29])))
+            self.redis_client.set(STATUS_KEY, json.dumps(status))
         if diagnostic is not None:
             stamp = int(time.time() * 1000)
             self.redis_pipeline.set(
@@ -380,6 +415,12 @@ class RealTimePolicyController(object):
                 
                 dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
                 self._last_measured_q = np.asarray(dof_pos, dtype=np.float32).copy()
+                self._last_measured_velocity = np.asarray(dof_vel, dtype=np.float32).copy()
+                if self.arm_pause is not None:
+                    self.arm_pause.update(
+                        self.redis_client.get(COMMAND_KEY), dof_pos,
+                        key_pressed(remote_keys, self.env.controller_mapping["B"]),
+                        time.time() * 1000)
                 
                 rpy = quatToEuler(quat)
 
@@ -451,6 +492,15 @@ class RealTimePolicyController(object):
                 redis_results = self.redis_pipeline.execute()
 
                 # Check if teleop data exists
+                if self.arm_pause is not None:
+                    # This protocol has its own freshness-gated atomic ref.
+                    # Missing legacy keys must not bypass the balance policy
+                    # and command the default pose while arms are held.
+                    redis_results[0] = json.dumps(self.arm_pause.reference(
+                        DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]).tolist())
+                    for i in (1, 2, 3):
+                        if redis_results[i] is None:
+                            redis_results[i] = "[]"
                 if redis_results[0] is None:
                     # During HIL, absence must HOLD; returning to the default
                     # pose would itself be an unrequested motion.  Preserve
@@ -466,7 +516,7 @@ class RealTimePolicyController(object):
 
                 # Check staleness via t_action timestamp (only if enabled)
                 data_is_stale = False
-                if self.check_stale:
+                if self.check_stale and self.arm_pause is None:
                     t_action_raw = redis_results[4]
                     if t_action_raw is None:
                         data_is_stale = True
@@ -496,6 +546,8 @@ class RealTimePolicyController(object):
                     continue
 
                 action_mimic = json.loads(redis_results[0])
+                if self.arm_pause is not None:
+                    action_mimic = self.arm_pause.reference(action_mimic).tolist()
                 action_hand_left = json.loads(redis_results[1])
                 action_hand_right = json.loads(redis_results[2])
                 action_neck = json.loads(redis_results[3])
@@ -504,6 +556,8 @@ class RealTimePolicyController(object):
                 if self.body_smoother is not None:
                     action_mimic = self.body_smoother.smooth(np.array(action_mimic, dtype=np.float32))
                     action_mimic = action_mimic.tolist()
+                if self.arm_pause is not None and self.arm_pause.held:
+                    action_mimic[21:35] = self.arm_pause.q.tolist()
             
                 
                 if self.use_hand:
@@ -649,7 +703,7 @@ class RealTimePolicyController(object):
                                         kp_motor_scale=kp_motor_scale,
                                         kd_motor_scale=kd_motor_scale)
                 
-                if self.use_hand:
+                if self.use_hand and not (self.arm_pause is not None and self.arm_pause.held):
                     self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
                 
                 elapsed = time.time() - t_start
@@ -721,6 +775,8 @@ def main():
                         help='Enable stale teleop data detection (hold pose when data is too old)')
     parser.add_argument('--disable_motion_start_button', action='store_true',
                         help='Force Redis motion_start_signal to 0; reserve B for bridge PAUSE. START/A unchanged.')
+    parser.add_argument('--bridge_arm_pause', action='store_true',
+                        help='Require full-task pause handshake; B locks measured arm targets before DDS.')
     parser.add_argument('--no_arm_override', action='store_true',
                         help='Ignore hil:right_arm_override (right arm stays '
                              'on the tracker even during HIL interventions)')
@@ -772,7 +828,8 @@ def main():
     print(f"  Smooth body: {args.smooth_body}")
     print(f"  Check stale: {args.check_stale}")
     print(f"  HIL safety: {args.hil_safety}")
-    print(f"  B motion-start button enabled: {not args.disable_motion_start_button}")
+    print(f"  B motion-start button enabled: {not args.disable_motion_start_button and not args.bridge_arm_pause}")
+    print(f"  Bridge measured-arm HOLD handshake: {args.bridge_arm_pause}")
     
     # 安全提示
     print("\n" + "="*50)
@@ -796,6 +853,7 @@ def main():
         smooth_body=args.smooth_body,
         check_stale=args.check_stale,
         motion_start_button_enabled=not args.disable_motion_start_button,
+        bridge_arm_pause=args.bridge_arm_pause,
         hil_safety=args.hil_safety,
         safety_urdf=args.safety_urdf,
         safety_velocity_scale=args.safety_velocity_scale,

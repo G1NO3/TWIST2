@@ -1,7 +1,9 @@
 """PICO sensor-only source. No GMR, viewer, Redis action keys or robot driver.
 
 Run this INSTEAD of teleop.sh/teleop_hil.sh for relative bimanual HIL.
-The SDK's raw poses are metres + xyzw, Unity coordinates (not GMR poses).
+The SDK's raw poses are metres + xyzw, native controller API values (not GMR
+poses). The historical `unity_raw` wire label is not a handedness guarantee;
+the consumer must explicitly calibrate the source basis.
 """
 from __future__ import annotations
 
@@ -59,7 +61,22 @@ def main():
     ap.add_argument("--output", default=DEFAULT_FILE)
     ap.add_argument("--hz", type=float, default=100.)
     ap.add_argument("--inspect", action="store_true", help="Print input only; write no state file")
+    ap.add_argument("--config", type=Path, help="Select unity_raw or isolated GMR sensor source")
+    ap.add_argument("--preflight", action="store_true", help="Import only; never initialize SDK")
     args = ap.parse_args()
+    if args.config:
+        config = json.loads(args.config.read_text())
+        frame = config.get("input_frame", "unity_raw")
+        if frame == "gmr_pelvis":
+            import sys
+            wrapper = Path(__file__).resolve().parents[1] / "pico_gmr_source.sh"
+            os.execv("/bin/bash", ["bash", str(wrapper), *sys.argv[1:]])
+        if frame != "unity_raw":
+            ap.error("unsupported input_frame")
+    if args.preflight:
+        import xrobotoolkit_sdk
+        print(f"PREFLIGHT OK (no SDK init): {xrobotoolkit_sdk.__file__}")
+        return
     if not math.isfinite(args.hz) or not 1 <= args.hz <= 200:
         ap.error("--hz must be 1..200")
     path = Path(args.output)
@@ -71,7 +88,7 @@ def main():
     sdk.init()
     session = uuid.uuid4().hex
     seq, previous = 0, 0
-    print("SENSOR ONLY: Y=left clutch, A=right clutch; B/left stick-click=hold request.", flush=True)
+    print("SENSOR ONLY: X=left clutch, A=right clutch; B/left stick-click=hold request.", flush=True)
     print("Keep Unitree physical stop available. No robot commands are published.", flush=True)
     try:
         while True:

@@ -67,7 +67,7 @@ def main():
     if args.config:
         config = json.loads(args.config.read_text())
         frame = config.get("input_frame", "unity_raw")
-        if frame == "gmr_pelvis":
+        if frame in ("gmr_pelvis", "body_pelvis"):
             import sys
             wrapper = Path(__file__).resolve().parents[1] / "pico_gmr_source.sh"
             os.execv("/bin/bash", ["bash", str(wrapper), *sys.argv[1:]])

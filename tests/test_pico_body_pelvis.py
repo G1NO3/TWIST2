@@ -67,3 +67,43 @@ def test_vertical_pelvis_heading_is_refused():
     with pytest.raises(ValueError, match='heading'):
         poses(human(pelvis_tilt=np.pi/2*.98, wrists={'Left_Wrist': ([0, 0, 0], Rotation.identity()),
                                                      'Right_Wrist': ([0, 0, 0], Rotation.identity())}))
+
+
+def _body_with_arms(h, arm_world):
+    """A 24x7 raw Body array (identity transform) holding the Pelvis of ``h``
+    and the given world arm-joint positions; quats [qx,qy,qz,qw] valid."""
+    from check_pico_gmr import BODY_NAMES
+    body = np.zeros((24, 7))
+    body[:, 6] = 1.
+    pel_q = h['Pelvis'][1]                                   # (w, x, y, z)
+    body[BODY_NAMES.index('Pelvis')] = list(h['Pelvis'][0]) + [pel_q[1], pel_q[2], pel_q[3], pel_q[0]]
+    for name, p in arm_world.items():
+        body[BODY_NAMES.index(name), :3] = p
+    return body
+
+
+@pytest.mark.parametrize('yaw', [0., 1.1, -2.7])
+@pytest.mark.parametrize('tilt', [0., .3])
+def test_arm_points_share_the_wrist_heading_frame(yaw, tilt):
+    pelvis_p = np.array([1., 2., .9])
+    h = human(yaw, tilt, pelvis_p=pelvis_p, wrists={'Left_Wrist': ([.3, .2, .1], Rotation.identity()),
+                                                    'Right_Wrist': ([.3, -.2, .1], Rotation.identity())})
+    local = {'Left_Shoulder': [0., .18, .35], 'Left_Elbow': [.1, .25, .12],
+             'Right_Shoulder': [0., -.18, .35], 'Right_Elbow': [.12, -.24, .1]}
+    H = Rotation.from_euler('z', yaw)
+    body = _body_with_arms(h, {n: pelvis_p + H.apply(p) for n, p in local.items()})
+    got = source.body_relative_arms(body, lambda raw: raw, h, OFF)
+    for side, side_cap in (('left', 'Left'), ('right', 'Right')):
+        np.testing.assert_allclose(got[side]['shoulder'], local[f'{side_cap}_Shoulder'], atol=1e-9)
+        np.testing.assert_allclose(got[side]['elbow'], local[f'{side_cap}_Elbow'], atol=1e-9)
+
+
+def test_invalid_arm_joint_omits_only_that_side():
+    from check_pico_gmr import BODY_NAMES
+    h = human(wrists={'Left_Wrist': ([.3, .2, .1], Rotation.identity()),
+                      'Right_Wrist': ([.3, -.2, .1], Rotation.identity())})
+    body = _body_with_arms(h, {'Left_Shoulder': [1., 2.2, 1.2], 'Left_Elbow': [1.1, 2.3, 1.],
+                               'Right_Shoulder': [1., 1.8, 1.2], 'Right_Elbow': [1.1, 1.7, 1.]})
+    body[BODY_NAMES.index('Right_Elbow'), 3:] = 0.            # invalid quaternion
+    got = source.body_relative_arms(body, lambda raw: raw, h, OFF)
+    assert set(got) == {'left'}

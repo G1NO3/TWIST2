@@ -84,6 +84,32 @@ def body_relative_wrists(human, offsets):
     return poses, dict(pelvis_tilt_deg=tilt, heading_yaw_deg=yaw)
 
 
+BODY_ARM = {"left": ("Left_Shoulder", "Left_Elbow"), "right": ("Right_Shoulder", "Right_Elbow")}
+
+
+def body_relative_arms(body, transform, human, offsets):
+    """{side: {"shoulder": xyz, "elbow": xyz}} in the SAME pelvis heading frame
+    as body_relative_wrists (positions only; segment twist is never used).
+
+    Optional context for the consumer's elbow-swivel task: a side whose
+    shoulder/elbow joint is invalid is OMITTED (the consumer then holds the
+    robot's swivel). It never refuses the wrist sample itself.
+    """
+    pelvis_p = np.asarray(human["Pelvis"][0], float)
+    H = heading_frame(Rotation.from_quat(human["Pelvis"][1], scalar_first=True) * offsets["Pelvis"])
+    out = {}
+    for side, names in BODY_ARM.items():
+        try:
+            joints = human_data(body, transform, names)
+        except (ValueError, TypeError, KeyError):
+            continue
+        pts = {key: H.inv().apply(np.asarray(joints[name][0], float) - pelvis_p)
+               for key, name in zip(("shoulder", "elbow"), names)}
+        if all(np.isfinite(p).all() for p in pts.values()):
+            out[side] = {key: p.tolist() for key, p in pts.items()}
+    return out
+
+
 def read_body_and_buttons(sdk):
     """Body path deliberately does NOT require native controller pose tracking."""
     stamp = int(sdk.get_time_stamp_ns())
@@ -181,8 +207,12 @@ def main():
                             if retarget is None:
                                 human = human_data(body, streamer.coordinate_transform_unity_data, BODY_REQUIRED)
                                 poses, extra = body_relative_wrists(human, offsets)
+                                arms = body_relative_arms(body, streamer.coordinate_transform_unity_data,
+                                                          human, offsets)
                                 for side in hands:
                                     hands[side]['pose'] = poses[side]
+                                    if side in arms:
+                                        hands[side]['arm'] = arms[side]
                             else:
                                 human = human_data(body, streamer.coordinate_transform_unity_data,
                                                    retarget.human_scale_table)

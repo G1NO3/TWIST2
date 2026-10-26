@@ -19,6 +19,7 @@ Differences from server_data_record.py (ZED):
 import argparse
 import json
 import os
+import signal
 import time
 
 import cv2
@@ -29,9 +30,20 @@ from multiprocessing import shared_memory
 import threading
 
 from data_utils.episode_writer import EpisodeWriter
+from data_utils.rl_episode_follow import RLEpisodeFollower
 from data_utils.vision_client import VisionClient
 from rich import print
-from robot_control.speaker import Speaker
+
+
+def write_rl_sidecar(episode_dir, rl_id, label, reason):
+    """<episode>/rl_episode.json: the RL replay episode this recording is, and
+    its latest outcome (a later discard rewrites only this small file)."""
+    path = os.path.join(episode_dir, "rl_episode.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"rl_episode": rl_id, "label": label, "outcome": reason,
+                   "time": time.time()}, f)
+    os.replace(tmp, path)
 
 
 def main(args):
@@ -146,6 +158,7 @@ def main(args):
     recorder.text_desc(goal=args.goal, desc=args.desc, steps=args.steps)
 
     control_dt = 1.0 / args.frequency
+    rl_dirs = {}  # RL episode id -> episode dir (for a post-terminal discard)
     step_count = 0
     frame_counter = 0  # for sub-sampling
     running = True
@@ -156,26 +169,85 @@ def main(args):
 
     print(f"Recorded control frequency: {args.frequency} Hz (subsample every {subsample_interval} frames)")
 
-    speaker = Speaker()
+    if args.episode_status is None:
+        from robot_control.speaker import Speaker  # pyttsx3; speak() blocks the loop
+        speaker = Speaker()
+    else:
+        # RL episodes open/close on the bridge's clock: a blocking voice line
+        # would drop the first frames of the next episode. Log only.
+        class speaker:
+            speak = staticmethod(lambda text: print(f"[recorder] {text}"))
     prev_button_pressed = False
     prev_right_axis_click_pressed = False
+
+    # --episode_status: episodes follow the RL bridge's status file instead of
+    # controller_data (which is then never read). Default off: unchanged.
+    follower = None
+    rl_status = None
+    pending_start = None
+    missing_warned = set()
+    if args.episode_status is not None:
+        follower = RLEpisodeFollower(
+            args.episode_status, stale_s=args.episode_stale_s,
+            instruction_path=os.path.join(os.path.dirname(args.episode_status), "phase_instruction.txt"))
+        print(f"Episodes follow {args.episode_status} (controller_data ignored)")
+
+        def _terminate(signum, frame):
+            raise KeyboardInterrupt  # GUI stop: save the open episode as interrupted
+        signal.signal(signal.SIGTERM, _terminate)
+
+    def save_rl_episode(rl_id, label, reason):
+        recorder.data["rl"] = {"episode": rl_id, "outcome": reason, "label": label,
+                               "root": (rl_status or {}).get("root"),
+                               "contract_sha256": (rl_status or {}).get("contract_sha256"),
+                               "episode_scope": (rl_status or {}).get("episode_scope")}
+        write_rl_sidecar(recorder.episode_dir, rl_id, label, reason)
+        recorder.save_episode(label=label)
+        speaker.speak(f"episode saved as {label}.")
 
     try:
         while running:
             start_time = time.time()
 
-            # ---- Controller input ----
-            controller_data = json.loads(redis_client.get("controller_data"))
-            button_pressed = controller_data["LeftController"]["key_two"]
+            if follower is not None:
+                rl_status = follower.read()
+                for event in follower.step(rl_status, start_time):
+                    if event[0] == "save" and recording:
+                        save_rl_episode(*event[1:])
+                        recording = False
+                    elif event[0] == "start":
+                        pending_start = event[1]
+                    elif event[0] == "relabel" and event[1] in rl_dirs:
+                        write_rl_sidecar(rl_dirs[event[1]], event[1], event[2], event[3])
+                        print(f"RL episode {event[1]} relabelled {event[2]} -> {rl_dirs[event[1]]}/rl_episode.json")
 
-            quit_key = controller_data["LeftController"]["axis_click"]
+                # The writer holds one episode: while the previous save is still
+                # writing, retry every tick instead of blocking the status loop.
+                if pending_start is not None and pending_start != follower.current:
+                    pending_start = None           # closed before it could start
+                if pending_start is not None and recorder.is_available:
+                    recording = recorder.create_episode()
+                    if recording:
+                        rl_dirs[pending_start] = recorder.episode_dir
+                        speaker.speak("episode recording started.")
+                        print(f"episode recording started for RL episode {pending_start}...")
+                    pending_start = None
+                    step_count = 0
+                    frame_counter = 0
+
+            # ---- Controller input ----
+            controller_data = (json.loads(redis_client.get("controller_data"))
+                               if follower is None else None)
+            button_pressed = follower is None and controller_data["LeftController"]["key_two"]
+
+            quit_key = follower is None and controller_data["LeftController"]["axis_click"]
             if quit_key:
                 running = False
                 speaker.speak("Recording stopped.")
                 print("\nQuitting...")
                 break
 
-            right_axis_click = controller_data["RightController"]["axis_click"]
+            right_axis_click = follower is None and controller_data["RightController"]["axis_click"]
 
             # Rising-edge toggle
             if button_pressed and not prev_button_pressed:
@@ -212,6 +284,8 @@ def main(args):
                     continue
 
                 data_dict = {"idx": step_count}
+                if follower is not None:
+                    data_dict.update(follower.frame_fields(rl_status))
 
                 # ---- Vision data ----
                 data_dict["rgb"] = image_array.copy()
@@ -284,7 +358,9 @@ def main(args):
                                 print(f"Warning: Failed to decode JSON for key {redis_keys[i]}")
                                 data_dict[dict_key] = None
                         else:
-                            print(f"Warning: No data found for key {redis_keys[i]}")
+                            if follower is None or redis_keys[i] not in missing_warned:
+                                missing_warned.add(redis_keys[i])
+                                print(f"Warning: No data found for key {redis_keys[i]}")
                             data_dict[dict_key] = None
                 except Exception as e:
                     print(f"Error in Redis pipeline operation: {e}")
@@ -321,6 +397,15 @@ def main(args):
         print("\nReceived Ctrl+C, exiting...")
         running = False
     finally:
+        if follower is not None and recording:
+            # close() would otherwise save it as "successful"
+            save_rl_episode(follower.current, "interrupted", "recorder_stopped")
+        if follower is not None:
+            # close() re-saves a still-pending episode as "successful": let the
+            # queued save (with its RL label) finish first.
+            deadline = time.monotonic() + 30.0
+            while not recorder.is_available and time.monotonic() < deadline:
+                time.sleep(0.05)
         print(f"\nDone! Recorded {recorder.episode_id + 1} episodes to {task_dir}")
 
         image_shared_memory.unlink()
@@ -365,6 +450,13 @@ if __name__ == "__main__":
     parser.add_argument("--goal", default="pick up the red cup", help="Task goal description")
     parser.add_argument("--desc", default="A humanoid robot picks up a red cup from the table.", help="Task description")
     parser.add_argument("--steps", default="step1: approach table. step2: grasp cup. step3: lift cup.", help="Task steps")
+
+    # Episodes from the RL bridge instead of controller_data (default off).
+    parser.add_argument("--episode_status", default=None,
+                        help="RL bridge status json (e.g. /tmp/policy_bridge/rlt_status.json): record every "
+                             "frame of every RL episode, labelled with its outcome; controller_data is not read")
+    parser.add_argument("--episode_stale_s", default=5.0, type=float,
+                        help="with --episode_status: a status older than this ends the episode as aborted")
 
     args = parser.parse_args()
     main(args)

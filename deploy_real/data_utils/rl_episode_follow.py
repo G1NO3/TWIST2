@@ -95,4 +95,8 @@ class RLEpisodeFollower:
                   "instruction": self.instruction()}
         if isinstance(status, dict):
             fields.update(rl_phase=status.get("phase"), rl_paused=status.get("paused"))
+            # native bridge lanes (VLAPolicyBridge native_episode_status.v1): the takeover's
+            # correcting state, rewritten the moment it changes -- the HG-DAgger human mask
+            if "human" in status:
+                fields.update(human=status.get("human"), hg_mode=status.get("hg_mode"))
         return fields

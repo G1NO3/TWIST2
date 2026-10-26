@@ -67,6 +67,9 @@ def test_frame_fields_and_instruction(tmp_path):
     f.step(status(1, episode="e1"), 1)
     fields = f.frame_fields(status(1, episode="e1"))
     assert fields["rl_episode"] == "e1" and fields["rl_phase"] == "p1" and fields["rl_paused"] is False
+    assert "human" not in fields                   # the RL editor's status carries no takeover state
+    fields = f.frame_fields(status(1, episode="e1", human=True, hg_mode="correcting"))
+    assert fields["human"] is True and fields["hg_mode"] == "correcting"
     assert fields["instruction"] == "Pick up the pipette." and isinstance(fields["t_mono_ns"], int)
 
 

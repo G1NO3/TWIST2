@@ -77,7 +77,7 @@ class _Stop(Exception):
     pass
 
 
-def run_recorder(tmp_path, monkeypatch, script, stop):
+def run_recorder(tmp_path, monkeypatch, script, stop, **extra):
     """rec.main with fake cameras/redis; script = {tick: status written by the bridge}."""
     rec = importlib.import_module("server_data_record_d435")
     status_path = tmp_path / "rlt_status.json"
@@ -128,7 +128,7 @@ def run_recorder(tmp_path, monkeypatch, script, stop):
                            robot_ip="127.0.0.1", camera_port=5555, width=8, height=6,
                            wrist_left_port=5556, wrist_right_port=None, wrist_width=8, wrist_height=6,
                            goal="g", desc="d", steps="s",
-                           episode_status=str(status_path), episode_stale_s=5.0)
+                           episode_status=str(status_path), episode_stale_s=5.0, **extra)
     rec.main(args)
 
     task = tmp_path / "raw" / "rl"
@@ -168,3 +168,23 @@ def test_recorder_stop_mid_episode_saves_interrupted(tmp_path, monkeypatch):
     data = json.loads((episodes[0] / "data.json").read_text())
     assert len(episodes) == 1 and data["label"] == "interrupted" and data["rl"]["outcome"] == "recorder_stopped"
     assert json.loads((episodes[0] / "rl_episode.json").read_text())["label"] == "interrupted"
+
+
+def test_recorder_wrist_left_crop_stores_the_box_only(tmp_path, monkeypatch):
+    """--wrist_left_crop: the left wrist jpgs are the box (of the 8x6 fake frame), data.json info says which."""
+    import cv2
+    episodes = run_recorder(tmp_path, monkeypatch, {1: status(1000, episode="e1"), 5: status(1000, last="e1", reason="success")},
+                            stop=7, wrist_left_crop="2,1,6,5")
+    data = json.loads((episodes[0] / "data.json").read_text())
+    assert data["info"]["wrist_left_crop"] == {"box": [2, 1, 6, 5], "of": [8, 6]}
+    assert cv2.imread(str(episodes[0] / data["data"][0]["rgb_wrist_left"])).shape == (4, 4, 3)
+    assert cv2.imread(str(episodes[0] / data["data"][0]["rgb"])).shape == (6, 8, 3)
+
+
+def test_parse_crop():
+    rec = importlib.import_module("server_data_record_d435")
+    assert rec.parse_crop(None, 1920, 1080) is None and rec.parse_crop("", 1920, 1080) is None
+    assert rec.parse_crop("600,240,1200,840", 1920, 1080) == (600, 240, 1200, 840)
+    for bad in ("600,240,1200", "1200,240,600,840", "0,0,1921,1080"):
+        with pytest.raises(ValueError):
+            rec.parse_crop(bad, 1920, 1080)

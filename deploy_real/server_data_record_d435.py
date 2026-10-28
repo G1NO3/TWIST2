@@ -7,7 +7,8 @@ Collects RGB + aligned depth from the D435i (via ZMQ), plus body/hand
 state and action from Redis, and writes episodes to disk. Optionally also
 merges in RGB from the two Arducam wrist cameras (--wrist_left_port /
 --wrist_right_port), so a single episode/data.json stays frame-aligned
-across all camera views and the robot state/action.
+across all camera views and the robot state/action. --wrist_left_crop stores
+only a box of the left wrist frame (the box lands in data.json info).
 
 Differences from server_data_record.py (ZED):
   - Single 424x240 RGB image (not stereo 1280x360)
@@ -33,6 +34,16 @@ from data_utils.episode_writer import EpisodeWriter
 from data_utils.rl_episode_follow import RLEpisodeFollower
 from data_utils.vision_client import VisionClient
 from rich import print
+
+
+def parse_crop(text, width, height):
+    """'x0,y0,x1,y1' (pixels of the width x height wrist frame) -> tuple, or None for none/''."""
+    if not text:
+        return None
+    box = tuple(int(v) for v in str(text).split(","))
+    if len(box) != 4 or not (0 <= box[0] < box[2] <= width and 0 <= box[1] < box[3] <= height):
+        raise ValueError(f"--wrist_left_crop {text!r}: want x0,y0,x1,y1 inside {width}x{height}")
+    return box
 
 
 def write_rl_sidecar(episode_dir, rl_id, label, reason):
@@ -82,6 +93,7 @@ def main(args):
 
     # ---- Shared memory for wrist cameras (RGB only, no depth) ----
     wrist_image_shape = (args.wrist_height, args.wrist_width, 3)
+    left_crop = parse_crop(getattr(args, "wrist_left_crop", None), args.wrist_width, args.wrist_height)
 
     wrist_left_shared_memory = None
     wrist_left_array = None
@@ -156,6 +168,8 @@ def main(args):
         data_keys=save_data_keys,
     )
     recorder.text_desc(goal=args.goal, desc=args.desc, steps=args.steps)
+    if left_crop is not None:
+        recorder.info["wrist_left_crop"] = {"box": list(left_crop), "of": [args.wrist_width, args.wrist_height]}
 
     control_dt = 1.0 / args.frequency
     rl_dirs = {}  # RL episode id -> episode dir (for a post-terminal discard)
@@ -300,7 +314,11 @@ def main(args):
 
                 # Wrist cameras: same-tick copy keeps frames aligned with D435 + state/action
                 if wrist_left_array is not None:
-                    data_dict["rgb_wrist_left"] = wrist_left_array.copy()
+                    if left_crop is not None:
+                        x0, y0, x1, y1 = left_crop
+                        data_dict["rgb_wrist_left"] = wrist_left_array[y0:y1, x0:x1].copy()
+                    else:
+                        data_dict["rgb_wrist_left"] = wrist_left_array.copy()
                     data_dict["t_img_wrist_left"] = int(time.time() * 1000)
                 if wrist_right_array is not None:
                     data_dict["rgb_wrist_right"] = wrist_right_array.copy()
@@ -445,6 +463,9 @@ if __name__ == "__main__":
     parser.add_argument("--wrist_right_port", default=None, type=int, help="ZMQ port for right wrist streamer (omit to disable)")
     parser.add_argument("--wrist_width", default=640, type=int, help="Wrist camera image width")
     parser.add_argument("--wrist_height", default=480, type=int, help="Wrist camera image height")
+    parser.add_argument("--wrist_left_crop", default=None,
+                        help="x0,y0,x1,y1: store only this box of the left wrist frame (pixels of "
+                             "--wrist_width x --wrist_height); omit for the whole frame")
 
     # Task description metadata
     parser.add_argument("--goal", default="pick up the red cup", help="Task goal description")

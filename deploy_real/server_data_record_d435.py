@@ -57,6 +57,112 @@ def write_rl_sidecar(episode_dir, rl_id, label, reason):
     os.replace(tmp, path)
 
 
+class FocusTapListener:
+    """--focus_tap host:port (2026-11-06): the policy server's FOCUS tap (starVLA focus_view.FocusTap) publishes the
+    window it served as VIEWJSN1:focus:<json> on every request and idle preview (5-10 Hz). Keeps the newest; every
+    recorded frame stores it under "focus" (with its age), so a dataset can crop the FOCUS view exactly as the policy
+    saw it instead of re-tracking the episode offline."""
+
+    def __init__(self, addr):
+        import zmq
+        self.latest, self.t = None, 0.0
+        sock = zmq.Context.instance().socket(zmq.SUB)
+        sock.setsockopt(zmq.SUBSCRIBE, b"VIEWJSN1:focus:")
+        sock.setsockopt(zmq.RCVHWM, 8)
+        sock.connect(f"tcp://{addr}")
+        self.sock = sock
+        threading.Thread(target=self._loop, name="focus-tap", daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                raw = self.sock.recv()
+                self.latest, self.t = json.loads(raw[len(b"VIEWJSN1:focus:"):]), time.time()
+            except Exception as e:                       # never let the tap stall the recorder
+                print(f"[focus_tap] {type(e).__name__}: {e}")
+                time.sleep(0.5)
+
+    def frame_field(self):
+        if self.latest is None:
+            return None
+        return dict(self.latest, age_ms=int(1000 * (time.time() - self.t)))
+
+
+class FeatureTapListener:
+    """--feature_tap host:port (2026-11-10): the policy server's feature tap (VLAPolicyBridge feature_tap.py)
+    publishes, per inference (5 Hz), the 30 action-token embeddings its action head read plus the base and served
+    chunks. Every message is kept (not just the newest); every recorded frame stores the newest seq under
+    "feat_seq" (with its age), and each saved episode gets features.npz with the inferences of its time span, so a
+    head / residual fine-tune trains on exactly what the policy saw without re-running the VLM
+    (outputs/head_ft/cache_recorded.py). Frames and inferences share this PC's wall clock (t_img / t_ms)."""
+
+    TOPIC = b"FEAT1"
+
+    def __init__(self, addr, keep=6000):
+        import collections
+        import zmq
+        self.records = collections.deque(maxlen=keep)       # ~20 min at 5 Hz, ~1 GB at worst
+        self.lock = threading.Lock()
+        self.latest, self.t = None, 0.0
+        sock = zmq.Context.instance().socket(zmq.SUB)
+        sock.setsockopt(zmq.SUBSCRIBE, self.TOPIC)
+        sock.setsockopt(zmq.RCVHWM, 256)
+        sock.connect(f"tcp://{addr}")
+        self.sock = sock
+        threading.Thread(target=self._loop, name="feature-tap", daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                parts = self.sock.recv_multipart()
+                head = json.loads(parts[1])
+                q = np.frombuffer(parts[2], np.float16).reshape(head["q_shape"])[0]
+                base = np.frombuffer(parts[3], np.float32).reshape(head["a_shape"])[0]
+                act = np.frombuffer(parts[4], np.float32).reshape(head["a_shape"])[0]
+                with self.lock:
+                    self.records.append((head, q, base, act))
+                self.latest, self.t = head, time.time()
+            except Exception as e:                       # never let the tap stall the recorder
+                print(f"[feature_tap] {type(e).__name__}: {e}")
+                time.sleep(0.5)
+
+    def frame_field(self):
+        if self.latest is None:
+            return None
+        return {"server": self.latest["server"], "seq": self.latest["seq"],
+                "age_ms": int(1000 * (time.time() - self.t))}
+
+    def write_episode(self, episode_dir, t0_ms, t1_ms):
+        """features.npz with every inference whose request time is in [t0_ms, t1_ms] (all from one server start,
+        the newest one if the server restarted mid-episode). In a thread: the save must not stall the 60 Hz loop."""
+        with self.lock:
+            recs = [r for r in self.records if t0_ms <= r[0]["t_ms"] <= t1_ms]
+        if recs:
+            server = recs[-1][0]["server"]
+            recs = [r for r in recs if r[0]["server"] == server]
+        if not recs or episode_dir is None:
+            return
+
+        def _write():
+            try:
+                head = {k: v for k, v in recs[0][0].items() if k not in ("seq", "t_ms", "explore_sigma")}
+                # residual heads (2026-11-11): the noise sigma each inference served (the console's noise switch
+                # changes it between episodes); NaN where the server did not say
+                extra = ({"explore_sigma": np.array([float(r[0].get("explore_sigma", np.nan)) for r in recs],
+                                                    np.float32)}
+                         if any("explore_sigma" in r[0] for r in recs) else {})
+                tmp = os.path.join(episode_dir, "features.tmp.npz")
+                np.savez(tmp, seq=np.array([r[0]["seq"] for r in recs], np.int64),
+                         t_ms=np.array([r[0]["t_ms"] for r in recs], np.int64),
+                         queries=np.stack([r[1] for r in recs]), base_action=np.stack([r[2] for r in recs]),
+                         action=np.stack([r[3] for r in recs]), header=np.array(json.dumps(head)), **extra)
+                os.replace(tmp, os.path.join(episode_dir, "features.npz"))
+                print(f"[feature_tap] {len(recs)} inferences -> {episode_dir}/features.npz")
+            except Exception as e:
+                print(f"[feature_tap] features.npz not written for {episode_dir}: {type(e).__name__}: {e}")
+        threading.Thread(target=_write, name="feature-write", daemon=True).start()
+
+
 def main(args):
     # ---- Redis connection ----
     try:
@@ -153,6 +259,20 @@ def main(args):
         )
         threading.Thread(target=wrist_right_client.receive_process, daemon=True).start()
 
+    focus_tap = FocusTapListener(args.focus_tap) if getattr(args, "focus_tap", None) else None
+    if focus_tap is not None:
+        print(f"[focus_tap] storing the served FOCUS window per frame from tcp://{args.focus_tap}")
+    feature_tap = FeatureTapListener(args.feature_tap) if getattr(args, "feature_tap", None) else None
+    if feature_tap is not None:
+        print(f"[feature_tap] storing every inference's head input per episode from tcp://{args.feature_tap}")
+    feat_span = [None, None]                       # t_img of the open episode's first / last recorded frame
+
+    def save_features():
+        # the inferences of the episode's span; 1 s before its first frame so the first frames have one
+        if feature_tap is not None and feat_span[0] is not None:
+            feature_tap.write_episode(recorder.episode_dir, feat_span[0] - 1000, feat_span[1] + 200)
+        feat_span[0] = feat_span[1] = None
+
     # ---- Episode writer ----
     recording = False
     save_data_keys = ["rgb", "depth"]
@@ -170,6 +290,10 @@ def main(args):
     recorder.text_desc(goal=args.goal, desc=args.desc, steps=args.steps)
     if left_crop is not None:
         recorder.info["wrist_left_crop"] = {"box": list(left_crop), "of": [args.wrist_width, args.wrist_height]}
+    if focus_tap is not None:
+        recorder.info["focus_tap"] = args.focus_tap
+    if feature_tap is not None:
+        recorder.info["feature_tap"] = args.feature_tap
 
     control_dt = 1.0 / args.frequency
     rl_dirs = {}  # RL episode id -> episode dir (for a post-terminal discard)
@@ -216,6 +340,7 @@ def main(args):
                                "contract_sha256": (rl_status or {}).get("contract_sha256"),
                                "episode_scope": (rl_status or {}).get("episode_scope")}
         write_rl_sidecar(recorder.episode_dir, rl_id, label, reason)
+        save_features()
         recorder.save_episode(label=label)
         speaker.speak(f"episode saved as {label}.")
 
@@ -275,11 +400,13 @@ def main(args):
                     frame_counter = 0
                     print("episode recording started...")
                 else:
+                    save_features()
                     recorder.save_episode(label="successful")
                     speaker.speak("episode saved as successful.")
 
             # Right axis_click: save as unsuccessful
             if right_axis_click and not prev_right_axis_click_pressed and recording:
+                save_features()
                 recorder.save_episode(label="unsuccessful")
                 recording = False
                 speaker.speak("episode saved as unsuccessful.")
@@ -323,6 +450,12 @@ def main(args):
                 if wrist_right_array is not None:
                     data_dict["rgb_wrist_right"] = wrist_right_array.copy()
                     data_dict["t_img_wrist_right"] = int(time.time() * 1000)
+                if focus_tap is not None:
+                    data_dict["focus"] = focus_tap.frame_field()
+                if feature_tap is not None:
+                    data_dict["feat_seq"] = feature_tap.frame_field()
+                    feat_span[0] = data_dict["t_img"] if feat_span[0] is None else feat_span[0]
+                    feat_span[1] = data_dict["t_img"]
 
                 # ---- Redis state & action ----
                 redis_keys = [
@@ -463,6 +596,11 @@ if __name__ == "__main__":
     parser.add_argument("--wrist_right_port", default=None, type=int, help="ZMQ port for right wrist streamer (omit to disable)")
     parser.add_argument("--wrist_width", default=640, type=int, help="Wrist camera image width")
     parser.add_argument("--wrist_height", default=480, type=int, help="Wrist camera image height")
+    parser.add_argument("--focus_tap", default=None,
+                        help="host:port of the policy server's FOCUS tap: store the served FOCUS window per frame")
+    parser.add_argument("--feature_tap", default=None,
+                        help="host:port of the policy server's feature tap: store every inference's head input "
+                             "(features.npz per episode) and the newest inference's seq per frame")
     parser.add_argument("--wrist_left_crop", default=None,
                         help="x0,y0,x1,y1: store only this box of the left wrist frame (pixels of "
                              "--wrist_width x --wrist_height); omit for the whole frame")

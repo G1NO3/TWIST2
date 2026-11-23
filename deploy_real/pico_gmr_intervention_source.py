@@ -66,6 +66,17 @@ def heading_frame(pelvis_rot):
     return Rotation.from_euler("z", np.arctan2(fwd[1], fwd[0]))
 
 
+def controller_world(raw, transform):
+    """A controller pose (metres + xyzw, Unity space) -> [x,y,z,qx,qy,qz,qw] in the SAME right-handed world frame
+    as the Body joints (GMR's Unity transform), NOT pelvis-relative: the consumer takes its displacement since the
+    clutch press, so neither the pelvis position estimate nor its jitter enters."""
+    out = transform({"c": [list(raw[:3]), [raw[6], raw[3], raw[4], raw[5]]]})["c"]
+    p, q = np.asarray(out[0], float), Rotation.from_quat(out[1], scalar_first=True).as_quat()
+    if not np.isfinite(p).all() or not np.isfinite(q).all():
+        raise ValueError("nonfinite controller pose")
+    return np.r_[p, q].tolist()
+
+
 def body_relative_wrists(human, offsets):
     """{side: [x,y,z,qx,qy,qz,qw]} wrist poses in the pelvis heading frame."""
     pelvis_p = np.asarray(human["Pelvis"][0], float)
@@ -131,6 +142,14 @@ def read_body_and_buttons(sdk):
             key_one=bool(getattr(sdk, f"get_{one}_button")()),
             key_two=bool(getattr(sdk, f"get_{two}_button")()),
             axis_click=bool(getattr(sdk, f"get_{side}_axis_click")()))
+        # The controller's own tracked pose (metres + xyzw, Unity space), OPTIONAL: a consumer that asks for it
+        # (controller_translation_sides, 2026-11-10) refuses the clutch when it is missing; Body stays the default.
+        try:   # any failure of this optional read must never gate the Body input
+            pose = [float(x) for x in getattr(sdk, f"get_{side}_controller_pose")()]
+        except Exception:
+            pose = []
+        if len(pose) == 7 and np.isfinite(pose).all() and .9 < sum(x * x for x in pose[3:]) < 1.1:
+            hands[side]["_controller_raw"] = pose
     if stamp <= 0 or stamp != int(sdk.get_time_stamp_ns()):
         return None
     return stamp, body, clock, hands
@@ -213,6 +232,10 @@ def main():
                                     hands[side]['pose'] = poses[side]
                                     if side in arms:
                                         hands[side]['arm'] = arms[side]
+                                    raw = hands[side].pop('_controller_raw', None)
+                                    if raw is not None:
+                                        hands[side]['controller_world'] = controller_world(
+                                            raw, streamer.coordinate_transform_unity_data)
                             else:
                                 human = human_data(body, streamer.coordinate_transform_unity_data,
                                                    retarget.human_scale_table)
@@ -221,6 +244,7 @@ def main():
                                     raise ValueError("nonfinite GMR result")
                                 mujoco.mj_forward(retarget.model, retarget.configuration.data)
                                 for side in hands:
+                                    hands[side].pop('_controller_raw', None)
                                     hands[side]['pose'] = pelvis_relative_pose(retarget.configuration.data, side)
                                 extra = dict(gmr_qpos=np.asarray(qpos).tolist())
                             if time.monotonic() - start >= stale:

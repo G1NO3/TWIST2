@@ -54,6 +54,7 @@ def test_buttons_read_without_native_controller_poses():
     stamp, body, clock, hands = source.read_body_and_buttons(sdk)
     assert stamp == 100 and body.shape == (24, 7)
     assert not hands['left']['key_one']
+    assert '_controller_raw' not in hands['left'] and '_controller_raw' not in hands['right']
     times = iter([100, 101])
     sdk.get_time_stamp_ns = lambda: next(times)
     assert source.read_body_and_buttons(sdk) is None
@@ -84,3 +85,40 @@ def test_no_robot_transport_imports():
         if isinstance(node, ast.Import): modules.extend(n.name for n in node.names)
         if isinstance(node, ast.ImportFrom): modules.append(node.module or '')
     assert not any(any(s in m for s in ('redis', 'unitree_sdk', 'robot_control', 'cyclonedds')) for m in modules)
+
+
+def test_a_valid_native_controller_pose_rides_along_and_an_invalid_one_is_dropped():
+    """controller_translation_sides (2026-11-10): the bridge may move an arm by the controller's own position;
+    the source attaches it when valid and silently omits it otherwise (Body input never waits for it)."""
+    poses = {'left': [.1, 1.2, .3, 0., 0., 0., 1.], 'right': [float('nan')] * 7}
+    class SDK:
+        def get_time_stamp_ns(self): return 100
+        def is_body_data_available(self): return True
+        def get_body_joints_pose(self): return np.tile([0, 0, 0, 0, 0, 0, 1], (24, 1))
+        def get_body_timestamp_ns(self): return 0
+        def get_body_joints_timestamp(self): return [100]*24
+        def __getattr__(self, key):
+            if key.endswith('_controller_pose'): return lambda: poses[key.split('_')[1]]
+            if key.endswith('_axis'): return lambda: [0., 0.]
+            if key.endswith(('_grip', '_trigger')): return lambda: .2
+            if key.endswith(('_button', '_axis_click')): return lambda: False
+            raise AttributeError(key)
+    _, _, _, hands = source.read_body_and_buttons(SDK())
+    assert hands['left']['_controller_raw'] == poses['left'] and '_controller_raw' not in hands['right']
+
+
+def test_controller_world_is_the_body_joints_world_frame():
+    """Same raw SDK pose -> same world pose as a Body joint (GMR's Unity transform): Unity up is world +z."""
+    from general_motion_retargeting import XRobotStreamer
+    from check_pico_gmr import BODY_NAMES, human_data
+    T = lambda d: XRobotStreamer.coordinate_transform_unity_data(None, d)
+    raw = [.1, 1.2, .3, 0., .7071068, 0., .7071068]
+    c = source.controller_world(raw, T)
+    body = np.tile([0., 0., 0., 0., 0., 0., 1.], (24, 1))
+    body[BODY_NAMES.index('Left_Wrist')] = raw
+    j = human_data(body, T, ['Left_Wrist'])['Left_Wrist']
+    np.testing.assert_allclose(c[:3], j[0], atol=1e-9)
+    np.testing.assert_allclose(Rotation.from_quat(c[3:]).as_matrix(),
+                               Rotation.from_quat(j[1], scalar_first=True).as_matrix(), atol=1e-6)
+    up = np.subtract(source.controller_world([.1, 1.3, .3] + raw[3:], T)[:3], c[:3])
+    np.testing.assert_allclose(up, [0., 0., .1], atol=1e-9)
